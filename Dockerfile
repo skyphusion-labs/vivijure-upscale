@@ -28,10 +28,17 @@ RUN just ubuntu2204
 # ---- stage 2: runtime -- install the .deb + the RunPod handler ------------------------------------
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
-# Vulkan loader (the NVIDIA ICD comes from the host driver via nvidia-container-runtime), ffmpeg, and
-# python for the handler. The video2x .deb pulls its own runtime libs (ncnn, spdlog, boost) via apt.
+# video2x is built against FFmpeg 7 (the `ubuntu2204` recipe adds ppa:ubuntuhandbook1/ffmpeg7), so the
+# RUNTIME must provide FFmpeg 7 libs too -- stock 22.04 ffmpeg (4.x) will NOT satisfy the .deb's dynamic
+# links. Add the same PPA FIRST, then let the .deb's Depends resolve the matching libav* from it.
+# (add-apt-repository writes to /etc/apt/sources.list.d, which survives the apt-list cleanup below.)
+# Vulkan loader only -- the NVIDIA Vulkan ICD is injected by nvidia-container-runtime on the GPU pod.
+# Models ship INSIDE the .deb (CMake `install(DIRECTORY models -> share/video2x)`), so no manual baking.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libvulkan1 vulkan-tools ffmpeg python3 python3-pip ca-certificates && \
+      software-properties-common ca-certificates gnupg && \
+    add-apt-repository -y ppa:ubuntuhandbook1/ffmpeg7 && \
+    apt-get update && apt-get install -y --no-install-recommends \
+      ffmpeg libvulkan1 vulkan-tools python3 python3-pip && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=builder /src/*.deb /tmp/video2x.deb
 RUN apt-get update && apt-get install -y --no-install-recommends /tmp/video2x.deb && \

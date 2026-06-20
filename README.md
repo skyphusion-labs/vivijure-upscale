@@ -48,15 +48,20 @@ docker push  ghcr.io/skyphusion-labs/vivijure-upscale:0.1.0
 Same release shape as vivijure-backend (GHCR + Jenkins tag-build); wire it into the `upscale` module
 as `RUNPOD_ENDPOINT` once the endpoint id exists.
 
+## RESOLVED (verified against k4yt3x/video2x master + release 6.4.0, 2026-06-20)
+- **`just ubuntu2204` recipe** -- confirmed valid (build file is `.justfile`, default branch `master`).
+  It adds `ppa:ubuntuhandbook1/ffmpeg7` and builds against FFmpeg 7.
+- **FFmpeg 7 runtime libs** -- the build links FFmpeg 7, so the runtime stage now adds the SAME PPA
+  (stock 22.04 ffmpeg 4.x would fail the .deb's dynamic links). Fixed in the Dockerfile runtime stage.
+- **Model files** -- ship IN the repo (`models/{realesrgan,realcugan,libplacebo,rife}`) and the CMake
+  rule `install(DIRECTORY models -> share/video2x)` packages them INTO the `.deb`. No manual baking;
+  installing the .deb gives `/usr/share/video2x/models`.
+
 ## OPEN ITEMS (verify on a real GPU pod -- the fiddly Vulkan bits)
-1. **`just` recipe name** for 22.04: docs show `just ubuntu2404`; confirm `just ubuntu2204` (or pin a
-   tag + use its recipe). Build emits the `.deb` the runtime stage installs.
-2. **Vulkan ICD on RunPod**: v6 needs the NVIDIA Vulkan ICD. It should be injected by the nvidia
+1. **Vulkan ICD on RunPod**: v6 needs the NVIDIA Vulkan ICD. It should be injected by the nvidia
    container runtime; verify `vulkaninfo` sees the GPU inside the running pod. If not, mount/install
    the ICD JSON (`/usr/share/vulkan/icd.d/nvidia_icd.json`).
-3. **Model files**: confirm the Real-ESRGAN model files (`realesr-animevideov3`, `realesrgan-plus`)
-   are bundled by the `.deb` or need fetching; bake them into the image if not.
-4. **GPU selection**: video2x picks GPU via `-g`; default 0 should be fine on a single-GPU pod.
+2. **GPU selection**: video2x picks GPU via `-g`; default 0 should be fine on a single-GPU pod.
 5. **Audio/format**: confirm video2x preserves the clip's audio (likely re-encodes video only). If it
    drops audio, the module/handler must remux it back (clips are usually silent pre-score, so low risk).
 6. **Encoder**: default codec; set `-c libx264` + a sane CRF for web-playable output if needed.
