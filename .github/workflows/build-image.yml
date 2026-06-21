@@ -1,0 +1,55 @@
+name: build-image
+
+# RunPod serverless image build for vivijure-upscale (sibling of vivijure-musetalk).
+# Mirrors the musetalk build: on a push to master that touches the image inputs,
+# build the Docker image and push it to GHCR as :latest + :<sha>. The endpoint
+# template is re-pinned to the new image separately (deliberate step).
+#
+# Runner: the org self-hosted fleet pool (private repo, no outside PRs). The
+# fleet agents have Docker; GHCR auth uses the built-in GITHUB_TOKEN (no PAT),
+# scoped to packages: write for this workflow only.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - Dockerfile
+      - handler.py
+      - requirements.txt
+      - .github/workflows/build-image.yml
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: [self-hosted, fleet]
+    timeout-minutes: 240
+    env:
+      IMAGE: ghcr.io/skyphusion-labs/vivijure-upscale
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free dangling images + log in to GHCR
+        run: |
+          docker image prune -f || true
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build image
+        run: docker build -t "$IMAGE:latest" -t "$IMAGE:${GITHUB_SHA}" .
+
+      - name: Push image
+        run: |
+          docker push "$IMAGE:latest"
+          docker push "$IMAGE:${GITHUB_SHA}"
+
+      - name: Remove local image to free runner disk
+        if: always()
+        run: docker image rm "$IMAGE:latest" "$IMAGE:${GITHUB_SHA}" || true
