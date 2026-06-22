@@ -19,7 +19,7 @@ This is the lightweight opposite of `vivijure-backend`, so it runs as its OWN se
 - Implication: simplest possible RunPod endpoint -- image only, no volume, small GPU, scale-to-zero.
 
 ## License boundary
-video2x is **GPLv3**. The handler runs it as a SEPARATE PROCESS (`subprocess` to the `video2x` CLI),
+video2x is **AGPL-3.0**. The handler runs it as a SEPARATE PROCESS (`subprocess` to the `video2x` CLI),
 so Vivijure's Worker/module code never links it (mere aggregation). This image distributes the GPL
 binary; its source is upstream at k4yt3x/video2x.
 
