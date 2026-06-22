@@ -65,3 +65,12 @@ as `RUNPOD_ENDPOINT` once the endpoint id exists.
 5. **Audio/format**: confirm video2x preserves the clip's audio (likely re-encodes video only). If it
    drops audio, the module/handler must remux it back (clips are usually silent pre-score, so low risk).
 6. **Encoder**: default codec; set `-c libx264` + a sane CRF for web-playable output if needed.
+
+## License
+
+This repo is [AGPL-3.0](LICENSE) -- free as in yours: self-host it, learn from it, build on it.
+
+It bundles and runs **video2x** (GPLv3) and its upscalers (Real-ESRGAN / RealCUGAN / Anime4K) as a
+separate process (see "License boundary" above); those remain under their own upstream licenses,
+with source at [k4yt3x/video2x](https://github.com/k4yt3x/video2x). A full third-party license
+inventory lives in `NOTICE` (added before this repo goes public, pending the upstream-license audit).
