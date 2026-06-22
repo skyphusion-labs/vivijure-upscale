@@ -19,9 +19,10 @@ This is the lightweight opposite of `vivijure-backend`, so it runs as its OWN se
 - Implication: simplest possible RunPod endpoint -- image only, no volume, small GPU, scale-to-zero.
 
 ## License boundary
-video2x is **GPLv3**. The handler runs it as a SEPARATE PROCESS (`subprocess` to the `video2x` CLI),
-so Vivijure's Worker/module code never links it (mere aggregation). This image distributes the GPL
-binary; its source is upstream at k4yt3x/video2x.
+video2x is **AGPL-3.0** (same license as this repo). The handler runs it as a SEPARATE PROCESS
+(`subprocess` to the `video2x` CLI), so Vivijure's Worker/module code never links it. This image
+distributes the video2x binary; its source is upstream at k4yt3x/video2x (the AGPL source-availability
+requirement is satisfied by that public upstream).
 
 ## Handler contract (job input)
 Presigned-URL transport, identical in spirit to `/film-titles` and the i2v modules -- the core holds
@@ -70,7 +71,7 @@ as `RUNPOD_ENDPOINT` once the endpoint id exists.
 
 This repo is [AGPL-3.0](LICENSE) -- free as in yours: self-host it, learn from it, build on it.
 
-It bundles and runs **video2x** (GPLv3) and its upscalers (Real-ESRGAN / RealCUGAN / Anime4K) as a
+It bundles and runs **video2x** (AGPL-3.0) and its upscalers (Real-ESRGAN / RealCUGAN / Anime4K) as a
 separate process (see "License boundary" above); those remain under their own upstream licenses,
 with source at [k4yt3x/video2x](https://github.com/k4yt3x/video2x). A full third-party license
 inventory lives in `NOTICE` (added before this repo goes public, pending the upstream-license audit).
