@@ -1,2 +1,6 @@
-runpod
+spandrel
+pillow
+numpy
 requests
+runpod
+boto3
