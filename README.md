@@ -56,5 +56,6 @@ pod and was never committed, so the image was the only surviving copy. `handler.
 
 ## License
 
-This wrapper is licensed under **AGPL-3.0** (see `LICENSE`). Third-party components it incorporates
-(Real-ESRGAN -- BSD-3-Clause; spandrel -- MIT; FFmpeg) are listed in `THIRD_PARTY_NOTICES.md`.
+**AGPL-3.0-only.** A labor of love, given freely: use it, learn from it, self-host it, build your own creative visions on it. Run it as a network service and the AGPL has you share your changes back, so it stays a commons. It is not for sale, and not to be resold as a SaaS.
+
+Third-party components it incorporates (Real-ESRGAN -- BSD-3-Clause; spandrel -- MIT; FFmpeg) are listed in `THIRD_PARTY_NOTICES.md`.
