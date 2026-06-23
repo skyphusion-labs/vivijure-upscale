@@ -2,8 +2,10 @@ name: build-image
 
 # RunPod serverless image build for vivijure-upscale (sibling of vivijure-musetalk).
 # Mirrors the musetalk build: on a push to master that touches the image inputs,
-# build the Docker image and push it to GHCR as :latest + :<sha>. The endpoint
-# template is re-pinned to the new image separately (deliberate step).
+# build the Docker image and push it to GHCR as :latest + :<sha>. A pushed semver
+# tag (v0.2.3) additionally publishes :0.2.3 -- the release image the endpoint
+# template is pinned to. The endpoint template is re-pinned to the new image
+# separately (deliberate step).
 #
 # Runner: the org self-hosted fleet pool (private repo, no outside PRs). The
 # fleet agents have Docker; GHCR auth uses the built-in GITHUB_TOKEN (no PAT),
@@ -18,6 +20,8 @@ on:
       - handler.py
       - requirements.txt
       - .github/workflows/build-image.yml
+    tags:
+      - 'v*'
 
 permissions:
   contents: read
@@ -42,14 +46,31 @@ jobs:
           docker image prune -f || true
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+      - name: Compute tags
+        id: tags
+        run: |
+          TAGS="$IMAGE:latest $IMAGE:${GITHUB_SHA}"
+          # A pushed semver tag (refs/tags/v0.2.3) also publishes the release tag :0.2.3.
+          case "${GITHUB_REF}" in
+            refs/tags/v*)
+              VERSION="${GITHUB_REF#refs/tags/v}"
+              TAGS="$TAGS $IMAGE:${VERSION}"
+              ;;
+          esac
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "Building tags: $TAGS"
+
       - name: Build image
-        run: docker build -t "$IMAGE:latest" -t "$IMAGE:${GITHUB_SHA}" .
+        run: |
+          ARGS=""
+          for t in ${{ steps.tags.outputs.tags }}; do ARGS="$ARGS -t $t"; done
+          docker build $ARGS .
 
       - name: Push image
         run: |
-          docker push "$IMAGE:latest"
-          docker push "$IMAGE:${GITHUB_SHA}"
+          for t in ${{ steps.tags.outputs.tags }}; do docker push "$t"; done
 
-      - name: Remove local image to free runner disk
+      - name: Remove local images to free runner disk
         if: always()
-        run: docker image rm "$IMAGE:latest" "$IMAGE:${GITHUB_SHA}" || true
+        run: |
+          for t in ${{ steps.tags.outputs.tags }}; do docker image rm "$t" || true; done

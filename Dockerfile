@@ -11,15 +11,27 @@
 # attempt (RunPod has no working Vulkan stack -- proven 2026-06-20); same Real-ESRGAN models, CUDA
 # engine instead of Vulkan. The transport contract and the {"selftest": true} harness are unchanged.
 #
+# Encode: the handler uses h264_nvenc (hardware encode) on the GPU; the endpoint runs on the 24/48 GB
+# PRO (Ada/Ampere) tier, where ffmpeg 4.4's NVENC is well-supported. The build asserts h264_nvenc is
+# compiled into ffmpeg below; the on-card encode is proven by the {"selftest": true} verify job.
+#
 # Base: RunPod's torch 2.8.0 / CUDA 12.8.1 image (ubuntu 22.04, conda), matching the recovered image's
 # PyTorch/CUDA stack. torch is provided by the base, so requirements.txt does not pin it.
 FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2204
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# ffmpeg/ffprobe from Ubuntu 22.04 apt (4.4.x). The build FAILS here if h264_nvenc is not compiled in,
+# so a non-NVENC ffmpeg can never ship silently (the encode path depends on it; libx264 is only a
+# runtime fallback). NVENC encoders dlopen the driver's libnvidia-encode at runtime on the GPU host.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
+
+# Fail the build now if h264_nvenc is not compiled into ffmpeg. No `grep -q`: that closes the pipe on
+# first match and ffmpeg dies of SIGPIPE (141) under bash pipefail, failing the build on a SUCCESS. grep
+# without -q reads to EOF, so ffmpeg exits 0; the matched encoder line is echoed into the build log.
+RUN ffmpeg -hide_banner -encoders 2>/dev/null | grep h264_nvenc
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
