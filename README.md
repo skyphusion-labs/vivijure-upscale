@@ -88,6 +88,27 @@ A non-ok result is a soft-degrade signal to the caller (pass the original throug
 | `UPSCALE_FP16` | `1` | fp16 inference via autocast (set `0` for fp32). fp16 is effectively lossless here (PSNR ~66 dB vs fp32, max 1 LSB). |
 | `R2_ENDPOINT_URL` / `R2_BUCKET` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | -- | R2 mode credentials (set in the RunPod dashboard). |
 
+## RunPod GPU config (which card to pin the endpoint to)
+
+This is a **GPU-bound** module (batched fp16 Real-ESRGAN + NVENC), so the endpoint should be pinned
+to a card with hardware NVENC and enough VRAM for the batch -- not the cheapest card. Per the
+GPU-rationing thesis, a faster card finishes the job in fewer billed seconds, so speed-per-dollar
+wins over sticker price.
+
+- **Recommended:** an Ada / Blackwell-Pro card with NVENC -- e.g. **L4 / L40S (Ada, sm_89)** or
+  **RTX PRO 6000 (Blackwell, sm_120)**. The reference number in "GPU-bound by design" (~3.5s for a
+  720p24x3s 2x upscale at 100% util) is on an **RTX 6000 Ada**.
+- **VRAM vs batch:** size `UPSCALE_BATCH` to the card. B16 needs ~8.7 GiB at 720p, ~17 GiB at 1080p;
+  a 24 GiB card runs B16/1080p comfortably, a 16 GiB card should drop the batch. `UPSCALE_TILE`
+  trades VRAM for kernel-launch overhead the same way.
+- **Avoid:** cards without usable NVENC -- the encode then falls back to bounded `libx264` on CPU
+  (the result reports `encoder` so the fallback is never silent, but it is slower and off-thesis).
+- **Where it is set:** the GPU type is selected on the **RunPod endpoint** (dashboard / endpoint
+  config), not in this repo. The image is GPU-agnostic; torch kernels come from the
+  `runpod/pytorch` cu1281 base, so there is **no `TORCH_CUDA_ARCH_LIST` to maintain here** (unlike
+  the sibling musetalk image, which compiles mmcv CUDA ops and does pin an arch list). Endpoint env
+  + GPU + registry-auth are the deliberate, dashboard-set knobs (RunPod's API does not honor them).
+
 ## Source provenance
 
 This repository's source was **recovered from the published image**
