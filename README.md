@@ -5,6 +5,26 @@ A RunPod serverless image that upscales video with **Real-ESRGAN**, run through 
 module (#191) -- extract frames -> upscale each (tiled to bound GPU memory) -> re-encode, audio
 copied through when present.
 
+## GPU-bound by design
+
+The whole pipeline keeps the GPU busy and the CPU out of the hot path:
+
+- **Inference + rescale on the GPU.** Real-ESRGAN runs on CUDA; the resize to the final frame size
+  (for a 2x request, and/or the resolution cap) is a GPU `interpolate`, not a CPU Lanczos pass.
+- **NVENC re-encode.** The final encode uses `h264_nvenc` (hardware encode) when the card + ffmpeg
+  support it. The encoder is probed once per worker (listed **and** a real test encode succeeds); if
+  NVENC is not usable, it falls back to a bounded `libx264` and **reports which encoder ran** in the
+  result (`encoder`), so a CPU fallback is never silent.
+- **Output resolution cap.** The models are 4x native, so a 4x of 1080p would be 8K (7680x4320). The
+  output long edge is capped (default **2160p / 4K UHD**, `MAX_OUTPUT_LONG_EDGE`) and a 2x request is
+  produced at 2x, so the encode and the per-frame PNG round-trip stay bounded regardless of source.
+- **Wall-clock guards.** Every ffmpeg phase has a hard timeout (`FFMPEG_TIMEOUT`, default 1200s). A
+  pathological clip degrades (ok:false -> the module passes the original through) instead of hanging
+  to the RunPod execution-timeout.
+
+This replaced a CPU-bound build whose `libx264 -preset medium` software encode of 4x/8K frames pegged
+the CPU at 100% while the GPU sat idle (the upscale ran on GPU but the encode did not).
+
 ## Engine: CUDA Real-ESRGAN (not Vulkan/video2x)
 
 An earlier attempt wrapped [video2x](https://github.com/k4yt3x/video2x) (Vulkan). RunPod has no
@@ -20,7 +40,8 @@ from xinntao's public releases:
 - `realesr-animevideov3` -- anime / fast (default).
 - `RealESRGAN_x4plus` -- general-purpose 4x.
 
-The models are 4x; a requested `scale` of 2 upscales 4x then downscales to 2x with a Lanczos pass.
+The models are 4x native; a requested `scale` of 2 is produced at 2x by a GPU downscale of the 4x
+inference output (no CPU Lanczos pass, no oversized intermediate on disk).
 
 ## Job input
 
@@ -38,13 +59,26 @@ Presigned mode (credentialless -- the caller presigns R2):
   "output_key": "renders/<project>/clips/<shot>_up.mp4", "scale": 2, "model": "realesr-animevideov3" }
 ```
 
-Self-test (no R2 -- confirms CUDA, loads the model, upscales a generated clip end to end):
+Self-test (no R2 -- confirms CUDA, loads the model, upscales a generated 720p24 x 3s clip end to end,
+and **proves the result is GPU-bound**):
 
 ```json
-{ "selftest": true }
+{ "selftest": true, "scale": 2 }
 ```
 
+The self-test result reports `encoder` + `nvenc_used` (which encoder actually ran), `phase_s` (the
+extract / upscale / encode wall-clock split), `gpu_sample` (sampled GPU + NVENC utilization, max/avg),
+`peak_vram_mib`, and `input_res` / `output_res`.
+
 A non-ok result is a soft-degrade signal to the caller (pass the original through), never a drop.
+
+## Tunables (endpoint env)
+
+| Env | Default | Effect |
+|-----|---------|--------|
+| `MAX_OUTPUT_LONG_EDGE` | `3840` | Output long-edge cap in px (2160p / 4K UHD). Bounds worst-case wall-clock. |
+| `FFMPEG_TIMEOUT` | `1200` | Per-ffmpeg-phase wall-clock guard (s). Exceeding it degrades the job, never hangs. |
+| `R2_ENDPOINT_URL` / `R2_BUCKET` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | -- | R2 mode credentials (set in the RunPod dashboard). |
 
 ## Source provenance
 
@@ -52,7 +86,8 @@ This repository's source was **recovered from the published image**
 `ghcr.io/skyphusion-labs/vivijure-upscale:0.2.2`: the original was built on a since-terminated RunPod
 pod and was never committed, so the image was the only surviving copy. `handler.py` and
 `requirements.txt` are verbatim from the image; the `Dockerfile` is reconstructed from
-`docker history` (functionally faithful, not byte-identical).
+`docker history` (functionally faithful, not byte-identical). The GPU-bound encode pipeline above
+(NVENC, resolution cap, GPU rescale, wall-clock guards) was added on top in `:0.2.3`.
 
 ## License
 
