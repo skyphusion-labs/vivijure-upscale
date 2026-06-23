@@ -26,8 +26,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 # runtime fallback). NVENC encoders dlopen the driver's libnvidia-encode at runtime on the GPU host.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg ca-certificates curl && \
-    rm -rf /var/lib/apt/lists/* && \
-    ffmpeg -hide_banner -encoders | grep -q h264_nvenc
+    rm -rf /var/lib/apt/lists/*
+
+# Fail the build now if h264_nvenc is not compiled into ffmpeg. No `grep -q`: that closes the pipe on
+# first match and ffmpeg dies of SIGPIPE (141) under bash pipefail, failing the build on a SUCCESS. grep
+# without -q reads to EOF, so ffmpeg exits 0; the matched encoder line is echoed into the build log.
+RUN ffmpeg -hide_banner -encoders 2>/dev/null | grep h264_nvenc
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
