@@ -2,13 +2,17 @@
 
 A RunPod serverless image that upscales video with **Real-ESRGAN**, run through PyTorch/CUDA via
 [spandrel](https://github.com/chaiNNer-org/spandrel). The GPU backend for Vivijure's `upscale`
-module (#191) -- extract frames -> upscale each (tiled to bound GPU memory) -> re-encode, audio
-copied through when present.
+module (#191) -- stream frames through ffmpeg pipes -> upscale in BATCHES on the GPU (fp16) -> re-encode,
+audio copied through when present. No per-frame PNG disk roundtrip; the GPU is the bottleneck, not I/O.
 
 ## GPU-bound by design
 
 The whole pipeline keeps the GPU busy and the CPU out of the hot path:
 
+- **No disk roundtrip; batched fp16 inference.** Frames stream in/out via ffmpeg `rawvideo` pipes (no
+  per-frame PNG read/write), and Real-ESRGAN runs on BATCHES of frames (`UPSCALE_BATCH`) in fp16
+  (autocast). This is what keeps the GPU fed: the upscale phase went from ~25s at ~12% GPU util to
+  ~3.5s at 100% peak util on an RTX 6000 Ada (720p24x3s, 2x), a ~7x speedup, output unchanged.
 - **Inference + rescale on the GPU.** Real-ESRGAN runs on CUDA; the resize to the final frame size
   (for a 2x request, and/or the resolution cap) is a GPU `interpolate`, not a CPU Lanczos pass.
 - **NVENC re-encode.** The final encode uses `h264_nvenc` (hardware encode) when the card + ffmpeg
@@ -17,13 +21,14 @@ The whole pipeline keeps the GPU busy and the CPU out of the hot path:
   result (`encoder`), so a CPU fallback is never silent.
 - **Output resolution cap.** The models are 4x native, so a 4x of 1080p would be 8K (7680x4320). The
   output long edge is capped (default **2160p / 4K UHD**, `MAX_OUTPUT_LONG_EDGE`) and a 2x request is
-  produced at 2x, so the encode and the per-frame PNG round-trip stay bounded regardless of source.
+  produced at 2x, so the encode and the in-memory frame buffers stay bounded regardless of source.
 - **Wall-clock guards.** Every ffmpeg phase has a hard timeout (`FFMPEG_TIMEOUT`, default 1200s). A
   pathological clip degrades (ok:false -> the module passes the original through) instead of hanging
   to the RunPod execution-timeout.
 
-This replaced a CPU-bound build whose `libx264 -preset medium` software encode of 4x/8K frames pegged
-the CPU at 100% while the GPU sat idle (the upscale ran on GPU but the encode did not).
+History: `:0.2.5` moved the re-encode off CPU `libx264` onto `h264_nvenc` (the original ship-blocker --
+the encode pegged the CPU for minutes). `:0.2.6` then made the upscale loop itself GPU-bound by removing
+the per-frame PNG disk roundtrip and batching the inference in fp16 (issue #7).
 
 ## Engine: CUDA Real-ESRGAN (not Vulkan/video2x)
 
@@ -66,9 +71,9 @@ and **proves the result is GPU-bound**):
 { "selftest": true, "scale": 2 }
 ```
 
-The self-test result reports `encoder` + `nvenc_used` (which encoder actually ran), `phase_s` (the
-extract / upscale / encode wall-clock split), `gpu_sample` (sampled GPU + NVENC utilization, max/avg),
-`peak_vram_mib`, and `input_res` / `output_res`.
+The self-test result reports `encoder` + `nvenc_used` (which encoder actually ran), `batch` + `fp16`
+(the inference settings used), `phase_s` (the decode / upscale / encode wall-clock split), `gpu_sample`
+(sampled GPU + NVENC utilization, max/avg), `peak_vram_mib`, and `input_res` / `output_res`.
 
 A non-ok result is a soft-degrade signal to the caller (pass the original through), never a drop.
 
@@ -77,7 +82,10 @@ A non-ok result is a soft-degrade signal to the caller (pass the original throug
 | Env | Default | Effect |
 |-----|---------|--------|
 | `MAX_OUTPUT_LONG_EDGE` | `3840` | Output long-edge cap in px (2160p / 4K UHD). Bounds worst-case wall-clock. |
-| `FFMPEG_TIMEOUT` | `1200` | Per-ffmpeg-phase wall-clock guard (s). Exceeding it degrades the job, never hangs. |
+| `FFMPEG_TIMEOUT` | `1200` | Per-phase wall-clock guard (s). Exceeding it degrades the job, never hangs. |
+| `UPSCALE_BATCH` | `16` | Frames per GPU inference batch. Higher = better GPU saturation, more VRAM (B16/720p ~8.7 GiB, /1080p ~17 GiB). Lower it on a smaller card. |
+| `UPSCALE_TILE` | `1024` | Tile size (px) for the tiled inference. Larger = fewer kernel launches (higher util), more VRAM. |
+| `UPSCALE_FP16` | `1` | fp16 inference via autocast (set `0` for fp32). fp16 is effectively lossless here (PSNR ~66 dB vs fp32, max 1 LSB). |
 | `R2_ENDPOINT_URL` / `R2_BUCKET` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | -- | R2 mode credentials (set in the RunPod dashboard). |
 
 ## Source provenance
