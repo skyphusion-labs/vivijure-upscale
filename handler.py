@@ -220,12 +220,12 @@ class _GpuSampler(threading.Thread):
 
     def __init__(self, period=0.5):
         super().__init__(daemon=True)
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._period = period
         self.samples = []  # list of (gpu_util%, enc_util%, mem_used_mib)
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 p = subprocess.run(
                     ["nvidia-smi",
@@ -239,10 +239,10 @@ class _GpuSampler(threading.Thread):
                         self.samples.append(tuple(int(float(x)) for x in parts[:3]))
             except Exception:  # noqa: BLE001 -- sampling is best-effort, never fails the job
                 pass
-            self._stop.wait(self._period)
+            self._stop_event.wait(self._period)
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
     def stats(self):
         if not self.samples:
