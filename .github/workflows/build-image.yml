@@ -1,5 +1,12 @@
 name: build-image
 
+# Runner: GitHub-hosted ubuntu-latest. This repo is PUBLIC, so per the standing runner policy
+# (public repos -> GitHub-hosted, fork-safe; private/internal -> the org fleet pool) the build runs
+# in the hosted sandbox, NOT on the self-hosted fleet. The CUDA base (runpod/pytorch cu1281) is a
+# tens-of-GB build; ubuntu-latest ships with only ~14GB free, so the "Free disk space" step below
+# reclaims ~25-30GB of preinstalled toolchains this image never uses (the same pattern proven in
+# vivijure-backend/release.yml). Without it the docker build blows the runner disk.
+
 # RunPod serverless image build for vivijure-upscale (sibling of vivijure-musetalk).
 # Mirrors the musetalk build: on a push to master that touches the image inputs,
 # build the Docker image and push it to GHCR as :latest + :<sha>. A pushed semver
@@ -7,9 +14,7 @@ name: build-image
 # template is pinned to. The endpoint template is re-pinned to the new image
 # separately (deliberate step).
 #
-# Runner: the org self-hosted fleet pool (private repo, no outside PRs). The
-# fleet agents have Docker; GHCR auth uses the built-in GITHUB_TOKEN (no PAT),
-# scoped to packages: write for this workflow only.
+# GHCR auth uses the built-in GITHUB_TOKEN (no PAT), scoped to packages: write for this run only.
 
 on:
   workflow_dispatch:
@@ -33,13 +38,26 @@ concurrency:
 
 jobs:
   build:
-    runs-on: [self-hosted, fleet]
+    runs-on: ubuntu-latest
     timeout-minutes: 240
     env:
       IMAGE: ghcr.io/skyphusion-labs/vivijure-upscale
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Free disk space (CUDA image needs more than the ~14GB hosted default)
+        run: |
+          set -eu
+          echo "--- before ---"; df -h /
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune -af || true
+          echo "--- after ---"; df -h /
 
       - name: Free dangling images + log in to GHCR
         run: |
