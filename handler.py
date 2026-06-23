@@ -4,12 +4,13 @@ Replaces the video2x/Vulkan path (RunPod has no working Vulkan stack -- proven 2
 (Real-ESRGAN), run through PyTorch/CUDA via spandrel. The transport contract + the {"selftest": true}
 harness are UNCHANGED from the Vulkan attempt -- only the engine swapped.
 
-The pipeline is GPU-bound end to end: Real-ESRGAN inference AND the final-size rescale run on the GPU,
-and the re-encode uses NVENC (`h264_nvenc`) when the card + ffmpeg support it. The output resolution is
-clamped (model is 4x native, but a 2x request is rescaled to 2x on the GPU, not 4x-then-CPU-downscale),
-and the long edge is capped (default 2160p / 4K UHD) so worst-case wall-clock is bounded. If NVENC is not
-usable on this image, encode HONESTLY falls back to a bounded libx264 (the resolution cap keeps the CPU
-encode bounded); the chosen encoder is reported in the result so a fallback is never silent.
+The pipeline is GPU-bound end to end: frames are streamed through ffmpeg pipes (raw rgb24 in and out --
+NO per-frame PNG disk roundtrip), upscaled in BATCHES on the GPU (fp16 via autocast), the final-size
+rescale runs on the GPU, and the re-encode uses NVENC (`h264_nvenc`) when the card + ffmpeg support it.
+The output resolution is clamped (model is 4x native, but a 2x request is rescaled to 2x on the GPU, not
+4x-then-CPU-downscale) and the long edge is capped (default 2160p / 4K UHD). If NVENC is not usable on
+this image, encode HONESTLY falls back to a bounded libx264 (the resolution cap keeps the CPU encode
+bounded); the chosen encoder is reported in the result so a fallback is never silent.
 
 Job input:
   {
@@ -46,14 +47,19 @@ MODEL_FILES = {
 }
 DOWNLOAD_TIMEOUT = 900
 UPLOAD_TIMEOUT = 900
-TILE = 512      # tile size (px) -- bounds GPU memory on large frames
+TILE = int(os.environ.get("UPSCALE_TILE", "1024") or "1024")  # tile size (px); env-tunable -- bounds GPU memory per tile pass
 TILE_PAD = 16   # tile overlap to hide seams
+# Frames per GPU batch: the model runs on (N,3,h,w) at once instead of a one-at-a-time Python loop, so
+# the per-frame launch/Python overhead is amortized and the GPU stays fed. Tune against VRAM.
+BATCH = int(os.environ.get("UPSCALE_BATCH", "16") or "16")
+# fp16 inference via autocast (weights stay fp32 -- no model.half() fragility). ~2x throughput, less VRAM.
+HALF = (os.environ.get("UPSCALE_FP16", "1") or "1").lower() not in ("0", "false", "no", "")
 # Cap the OUTPUT long edge (px). 3840 = 2160p / 4K UHD. The model is 4x native, so a 4x of a 1080p
-# source would otherwise be 8K (7680x4320); the cap keeps the encode (and the per-frame PNG round-trip)
-# bounded regardless of source size. Overridable via env for a deliberately larger render.
+# source would otherwise be 8K (7680x4320); the cap bounds the encode + the in-memory frame buffers
+# regardless of source size. Overridable via env for a deliberately larger render.
 MAX_LONG_EDGE = int(os.environ.get("MAX_OUTPUT_LONG_EDGE", "3840") or "3840")
-# Per-ffmpeg-phase wall-clock guard (s). A phase that blows past this is killed and the job degrades
-# (ok:false -> module passthrough) instead of hanging to the RunPod execution-timeout.
+# Per-phase wall-clock guard (s). A phase that blows past this aborts and the job degrades (ok:false ->
+# module passthrough) instead of hanging to the RunPod execution-timeout.
 FFMPEG_TIMEOUT = int(os.environ.get("FFMPEG_TIMEOUT", "1200") or "1200")
 
 _MODELS = {}  # name -> loaded spandrel descriptor (warm-worker cache)
@@ -65,13 +71,12 @@ def _device():
 
 
 def _run(cmd, timeout=FFMPEG_TIMEOUT):
-    """subprocess.run with a hard wall-clock guard. TimeoutExpired/CalledProcessError propagate up to
-    the handler's try/except, which returns ok:false -- an honest degrade, never a hang."""
+    """subprocess.run with a hard wall-clock guard, used for the short probe/utility ffmpeg calls."""
     return subprocess.run(cmd, check=True, timeout=timeout)
 
 
 def _probe_nvenc():
-    """True only if h264_nvenc is BOTH listed AND actually encodes on this GPU. Old ffmpeg NVENC API
+    """True only if h264_nvenc is BOTH listed AND actually encodes on this GPU. An old ffmpeg NVENC API
     (e.g. an old Ubuntu build) can list the encoder yet fail at runtime on some GPU/driver combos, so a
     real test encode is the only honest check; the chosen encoder is reported. Cached on the warm worker."""
     try:
@@ -110,35 +115,39 @@ def _load_model(name):
     name = name if name in MODEL_FILES else "realesr-animevideov3"
     if name not in _MODELS:
         m = ModelLoader().load_from_file(os.path.join(MODELS_DIR, MODEL_FILES[name]))
-        m.to(_device()).eval()  # fp32 -- tiling bounds memory; fp16 is a later optimization
+        m.to(_device()).eval()  # weights fp32; fp16 is applied per-op via autocast in _upscale_batch
         _MODELS[name] = m
     return _MODELS[name]
 
 
 @torch.inference_mode()
-def _upscale_image(model, img, out_w, out_h):
-    """Upscale a PIL image with the model (tiled to bound GPU memory), then resize to (out_w,out_h) ON
-    THE GPU so the result is the final frame size -- no CPU lanczos pass, no oversized PNG on disk."""
+def _upscale_batch(model, frames_np, out_w, out_h):
+    """Upscale a BATCH of same-size frames on the GPU, tiled to bound memory, then GPU-resize to
+    (out_w,out_h). `frames_np` is a list of (h,w,3) uint8 arrays; returns an (N,out_h,out_w,3) uint8
+    array. fp16 via autocast when enabled. No disk, no per-frame Python round-trip."""
+    cuda = torch.cuda.is_available()
     scale = getattr(model, "scale", 4)
-    arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
-    t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(_device())
-    _, _, h, w = t.shape
-    out = torch.zeros((1, 3, h * scale, w * scale), dtype=t.dtype, device=t.device)
+    arr = np.stack(frames_np).astype(np.float32) / 255.0      # (N,h,w,3)
+    t = torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous().to(_device())  # (N,3,h,w)
+    n, _, h, w = t.shape
+    out = torch.zeros((n, 3, h * scale, w * scale), dtype=torch.float32, device=t.device)
+    use_half = HALF and cuda
     for y in range(0, h, TILE):
         for x in range(0, w, TILE):
             y0, x0 = max(y - TILE_PAD, 0), max(x - TILE_PAD, 0)
             y1, x1 = min(y + TILE + TILE_PAD, h), min(x + TILE + TILE_PAD, w)
-            ot = model(t[:, :, y0:y1, x0:x1])  # spandrel descriptor is callable: (1,3,h,w)->(1,3,h*s,w*s)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_half):
+                ot = model(t[:, :, y0:y1, x0:x1])  # (N,3,th,tw) -> (N,3,th*s,tw*s)
+            ot = ot.float()
             cy1, cx1 = min(y + TILE, h), min(x + TILE, w)
             sy, sx = (y - y0) * scale, (x - x0) * scale
             th, tw = (cy1 - y) * scale, (cx1 - x) * scale
             out[:, :, y * scale:cy1 * scale, x * scale:cx1 * scale] = ot[:, :, sy:sy + th, sx:sx + tw]
     if out.shape[-1] != out_w or out.shape[-2] != out_h:
-        # GPU rescale to the final frame size (downscale for a 2x request and/or the long-edge cap).
         out = torch.nn.functional.interpolate(
             out, size=(out_h, out_w), mode="bicubic", align_corners=False, antialias=True)
-    a = out.clamp(0, 1).squeeze(0).permute(1, 2, 0).float().cpu().numpy()
-    return Image.fromarray((a * 255.0 + 0.5).astype(np.uint8))
+    out = out.clamp(0, 1).mul_(255.0).add_(0.5).permute(0, 2, 3, 1).to(torch.uint8)
+    return out.cpu().numpy()  # (N,out_h,out_w,3)
 
 
 def _ffprobe(path, entries):
@@ -159,58 +168,99 @@ def _has_audio(path):
     return bool((p.stdout or "").strip())
 
 
+def _read_exact(stream, n):
+    """Read exactly n bytes from a pipe (it can short-read). Returns None at a clean EOF or on a trailing
+    partial frame (valid streams deliver whole frames)."""
+    parts, got = [], 0
+    while got < n:
+        chunk = stream.read(n - got)
+        if not chunk:
+            return None
+        parts.append(chunk)
+        got += len(chunk)
+    return b"".join(parts)
+
+
 def _upscale_video(model, src, dst, final_scale):
-    """Extract frames -> upscale + GPU-resize each to the final (capped) size -> re-encode. Audio is
-    copied through when the source has it. Returns a dict: frames, encoder, out_w/out_h, and per-phase
-    seconds (extract/upscale/encode) so the caller can prove where the wall-clock actually goes."""
-    work = os.path.dirname(dst)
-    fin, fout = os.path.join(work, "fin"), os.path.join(work, "fout")
-    os.makedirs(fin, exist_ok=True)
-    os.makedirs(fout, exist_ok=True)
+    """Decode -> batched GPU upscale + GPU resize -> re-encode, entirely through ffmpeg rawvideo pipes
+    (no PNG disk roundtrip). Audio is copied when present. Returns a dict: frames, encoder, out dims,
+    per-phase seconds (decode/upscale/encode), and the batch/fp16 settings actually used."""
     fps = (_ffprobe(src, "stream=r_frame_rate") or ["24/1"])[0]
     wh = _ffprobe(src, "stream=width,height")
     sw, sh = (int(wh[0]), int(wh[1])) if len(wh) >= 2 else (0, 0)
-    # Honor the REQUESTED scale (2x = 2x, not 4x-then-downscale) and clamp the long edge.
-    out_w, out_h = _capped(sw * final_scale, sh * final_scale, MAX_LONG_EDGE) if (sw and sh) else (0, 0)
+    if not (sw and sh):
+        raise RuntimeError("could not probe source dimensions")
+    out_w, out_h = _capped(sw * final_scale, sh * final_scale, MAX_LONG_EDGE)
+    encoder = "h264_nvenc" if _nvenc_available() else "libx264"
+    deadline = time.monotonic() + FFMPEG_TIMEOUT
+    fsize = sw * sh * 3
 
+    # --- decode (no disk): pull raw rgb24 frames from an ffmpeg pipe into memory ---
     t0 = time.monotonic()
-    _run(["ffmpeg", "-v", "error", "-y", "-i", src, os.path.join(fin, "%06d.png")])
-    files = sorted(f for f in os.listdir(fin) if f.endswith(".png"))
-    if not files:
-        raise RuntimeError("no frames extracted from source")
-    if not (out_w and out_h):
-        # ffprobe gave no dims; fall back to the model native scale for this frame size.
-        probe = Image.open(os.path.join(fin, files[0]))
-        ms = getattr(model, "scale", 4)
-        out_w, out_h = _capped(probe.width * ms, probe.height * ms, MAX_LONG_EDGE)
-
+    dec = subprocess.Popen(
+        ["ffmpeg", "-v", "error", "-i", src, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+        stdout=subprocess.PIPE, bufsize=max(fsize, 1 << 20))
+    inputs = []
+    try:
+        while True:
+            buf = _read_exact(dec.stdout, fsize)
+            if buf is None:
+                break
+            inputs.append(buf)
+            if time.monotonic() > deadline:
+                raise TimeoutError("decode exceeded FFMPEG_TIMEOUT")
+    finally:
+        dec.stdout.close()
+        dec.wait()
+    if not inputs:
+        raise RuntimeError("no frames decoded from source")
     t1 = time.monotonic()
-    for f in files:
-        _upscale_image(model, Image.open(os.path.join(fin, f)), out_w, out_h).save(os.path.join(fout, f))
+
+    # --- upscale (GPU, batched) -- drop each input batch as it is consumed to bound peak RAM ---
+    outputs = []
+    for i in range(0, len(inputs), BATCH):
+        chunk = inputs[i:i + BATCH]
+        frames_np = [np.frombuffer(b, dtype=np.uint8).reshape(sh, sw, 3) for b in chunk]
+        outs = _upscale_batch(model, frames_np, out_w, out_h)  # (n,out_h,out_w,3) uint8
+        outputs.extend(np.ascontiguousarray(f).tobytes() for f in outs)
+        for j in range(i, min(i + BATCH, len(inputs))):
+            inputs[j] = None
+        if time.monotonic() > deadline:
+            raise TimeoutError("upscale exceeded FFMPEG_TIMEOUT")
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-
+    del inputs
     t2 = time.monotonic()
-    encoder = "h264_nvenc" if _nvenc_available() else "libx264"
-    cmd = ["ffmpeg", "-v", "error", "-y", "-framerate", fps, "-i", os.path.join(fout, "%06d.png")]
+
+    # --- encode (no disk): feed raw rgb24 frames to an ffmpeg pipe -> nvenc/libx264 ---
+    enc_cmd = ["ffmpeg", "-v", "error", "-y",
+               "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{out_w}x{out_h}",
+               "-framerate", fps, "-i", "-"]
     if _has_audio(src):
-        cmd += ["-i", src, "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-shortest"]
-    # Frames are already the final size (resized on the GPU), so no -vf scale here.
+        enc_cmd += ["-i", src, "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-shortest"]
     if encoder == "h264_nvenc":
-        cmd += ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "19", "-pix_fmt", "yuv420p"]
+        enc_cmd += ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "19", "-pix_fmt", "yuv420p"]
     else:
-        # Honest fallback: bounded by the resolution cap; faster preset than the old medium/crf17.
-        cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "19", "-preset", "fast"]
-    cmd += [dst]
-    _run(cmd)
+        enc_cmd += ["-c:v", "libx264", "-crf", "19", "-preset", "fast", "-pix_fmt", "yuv420p"]
+    enc_cmd += [dst]
+    enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE)
+    try:
+        for fb in outputs:
+            enc.stdin.write(fb)
+    finally:
+        enc.stdin.close()
+        rc = enc.wait()
+    if rc != 0:
+        raise RuntimeError(f"encode pipe exited rc={rc}")
     t3 = time.monotonic()
     return {
-        "frames": len(files),
+        "frames": len(outputs),
         "encoder": encoder,
         "out_w": out_w, "out_h": out_h,
         "extract_s": round(t1 - t0, 2),
         "upscale_s": round(t2 - t1, 2),
         "encode_s": round(t3 - t2, 2),
+        "batch": BATCH, "fp16": bool(HALF and torch.cuda.is_available()),
     }
 
 
@@ -288,8 +338,8 @@ class _GpuSampler(threading.Thread):
 def _selftest(inp):
     """Self-contained GPU verification -- NO R2 needed. Confirms CUDA + loads the model, generates a real
     multi-second clip, upscales it end to end, and PROVES the result is GPU-bound: it reports which encoder
-    actually ran (asserting NVENC where expected), the per-phase wall-clock split, and sampled GPU/encoder
-    utilization + peak VRAM. Trigger with {"selftest": true}; doubles as a health check."""
+    actually ran (asserting NVENC where expected), the per-phase wall-clock split, sampled GPU/encoder
+    utilization + peak VRAM, and the batch/fp16 settings. Trigger with {"selftest": true}."""
     model_name = str(inp.get("model", "realesr-animevideov3"))
     final_scale = 4 if int(inp.get("scale", 2) or 2) >= 4 else 2
     out = {"ok": False, "selftest": True, "torch_version": torch.__version__,
@@ -326,6 +376,7 @@ def _selftest(inp):
         out["frames"] = info["frames"]
         out["encoder"] = info["encoder"]
         out["nvenc_used"] = info["encoder"] == "h264_nvenc"
+        out["batch"], out["fp16"] = info["batch"], info["fp16"]
         out["phase_s"] = {"extract": info["extract_s"], "upscale": info["upscale_s"],
                           "encode": info["encode_s"]}
         out["gpu_sample"] = sampler.stats()
