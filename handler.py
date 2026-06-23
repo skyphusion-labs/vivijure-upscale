@@ -215,31 +215,55 @@ def _upscale_video(model, src, dst, final_scale):
 
 
 class _GpuSampler(threading.Thread):
-    """Polls nvidia-smi in the background so the selftest can report HONEST GPU/encoder utilization over
-    a real multi-second clip -- proving the pipeline is GPU-bound, not a cherry-picked single number."""
+    """Polls nvidia-smi in the background so the selftest can report HONEST GPU utilization + VRAM (and
+    best-effort encoder utilization) over a real multi-second clip -- proving the pipeline is GPU-bound,
+    not a cherry-picked single number."""
 
     def __init__(self, period=0.5):
         super().__init__(daemon=True)
         self._stop_event = threading.Event()
         self._period = period
-        self.samples = []  # list of (gpu_util%, enc_util%, mem_used_mib)
+        self.samples = []  # list of (gpu_util%, mem_used_mib, enc_util%|None)
 
     def run(self):
         while not self._stop_event.is_set():
-            try:
-                p = subprocess.run(
-                    ["nvidia-smi",
-                     "--query-gpu=utilization.gpu,utilization.encoder,memory.used",
-                     "--format=csv,noheader,nounits"],
-                    capture_output=True, text=True, timeout=5)
-                row = (p.stdout or "").strip().splitlines()
-                if row:
-                    parts = [x.strip() for x in row[0].split(",")]
-                    if len(parts) >= 3:
-                        self.samples.append(tuple(int(float(x)) for x in parts[:3]))
-            except Exception:  # noqa: BLE001 -- sampling is best-effort, never fails the job
-                pass
+            self._sample_once()
             self._stop_event.wait(self._period)
+
+    def _sample_once(self):
+        # utilization.gpu (SM %) + memory.used (MiB) are universally valid --query-gpu fields.
+        # (utilization.encoder is NOT a --query-gpu field, so encoder util is read separately below.)
+        # Any failure is swallowed -- sampling is best effort and never fails the job.
+        try:
+            p = subprocess.run(
+                ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5)
+            row = (p.stdout or "").strip().splitlines()
+            if not row:
+                return
+            parts = [x.strip() for x in row[0].split(",")]
+            if len(parts) < 2:
+                return
+            gpu_util, mem_used = int(float(parts[0])), int(float(parts[1]))
+        except Exception:  # noqa: BLE001
+            return
+        self.samples.append((gpu_util, mem_used, self._enc_util()))
+
+    @staticmethod
+    def _enc_util():
+        # Encoder-engine utilization is not in --query-gpu; read the Utilization section of `-q`.
+        # Returns None if the field is absent on this driver (then it is just omitted from the report).
+        try:
+            p = subprocess.run(["nvidia-smi", "-q", "-d", "UTILIZATION"],
+                               capture_output=True, text=True, timeout=5)
+            for ln in (p.stdout or "").splitlines():
+                key, sep, val = ln.partition(":")
+                if sep and key.strip() == "Encoder":
+                    return int(float(val.strip().rstrip("%").strip()))
+        except Exception:  # noqa: BLE001
+            pass
+        return None
 
     def stop(self):
         self._stop_event.set()
@@ -248,14 +272,17 @@ class _GpuSampler(threading.Thread):
         if not self.samples:
             return {"samples": 0}
         g = [s[0] for s in self.samples]
-        e = [s[1] for s in self.samples]
-        m = [s[2] for s in self.samples]
-        return {
+        m = [s[1] for s in self.samples]
+        e = [s[2] for s in self.samples if s[2] is not None]
+        out = {
             "samples": len(self.samples),
             "gpu_util_max": max(g), "gpu_util_avg": round(sum(g) / len(g), 1),
-            "enc_util_max": max(e), "enc_util_avg": round(sum(e) / len(e), 1),
             "mem_used_max_mib": max(m),
         }
+        if e:
+            out["enc_util_max"] = max(e)
+            out["enc_util_avg"] = round(sum(e) / len(e), 1)
+        return out
 
 
 def _selftest(inp):
