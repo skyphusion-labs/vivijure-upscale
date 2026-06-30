@@ -82,3 +82,19 @@ CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
+
+---
+
+## FFmpeg (LGPL-2.1+ / GPL-2.0+): written offer of corresponding source
+
+FFmpeg is redistributed inside this Docker image as packaged by the image OS distribution. It is
+invoked only as a separate subprocess and is not linked into the AGPL-licensed wrapper code. Depending
+on the build flags of the packaged binary, FFmpeg is covered by the GNU LGPL-2.1-or-later, and some
+components may fall under the GNU GPL-2.0-or-later. We do not modify FFmpeg.
+
+For the exact binary shipped, the corresponding source is the source package of the image OS
+distribution; upstream source is at https://ffmpeg.org/download.html and
+https://git.ffmpeg.org/ffmpeg.git. In addition, for three years from the date you received this image,
+you may obtain the complete corresponding source for the FFmpeg version it ships by contacting
+legal@skyphusion.org; we will provide it (or a download location) at no more than our cost of
+distribution.
