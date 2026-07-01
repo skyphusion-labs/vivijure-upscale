@@ -1,47 +1,154 @@
 # vivijure-upscale
 
-A RunPod serverless image that upscales video with **Real-ESRGAN**, run through PyTorch/CUDA via
-[spandrel](https://github.com/chaiNNer-org/spandrel). The GPU backend for Vivijure's `upscale`
-module (#191) -- stream frames through ffmpeg pipes -> upscale in BATCHES on the GPU (fp16) -> re-encode,
-audio copied through when present. No per-frame PNG disk roundtrip; the GPU is the bottleneck, not I/O.
+**Makes your finished video sharper and higher-resolution.** This is the video upscale finish engine
+for [Vivijure](https://github.com/skyphusion-labs/vivijure), the AI film studio. It runs on a GPU
+(RunPod), takes a clip, and hands back a 2x or 4x version. Under the hood it is **Real-ESRGAN** run on
+PyTorch/CUDA through [spandrel](https://github.com/chaiNNer-org/spandrel).
 
-## The Vivijure ecosystem
+## Where this fits
 
-Vivijure is an AI film studio built as a thin control plane plus opt-in GPU modules. These repos
-form the constellation; this block is identical in each so the whole map is visible from any one of
-them.
+Vivijure is not one program. It is a small group of programs that work together, called the
+**constellation**. The **Studio** is the center; it tells engines like this one what to do. This map
+is the same in every repo, so you always know where you are.
 
+```mermaid
+flowchart TD
+    subgraph front[You and your friends]
+        discord[Discord chat]
+        ui[Studio web page]
+    end
+
+    slate[slate<br/>Discord screenwriter bot]
+
+    subgraph core[The control plane]
+        studio[vivijure Studio<br/>projects, storyboard, cast,<br/>render orchestration + module registry]
+    end
+
+    subgraph modules[Modules: one job each, opt-in]
+        cloudmods[Cloud video modules<br/>Seedance, Kling, Veo, Wan, ...]
+        finishmods[Finish modules<br/>upscale, smooth, lip-sync, titles]
+        audiomods[Audio modules<br/>music, narration]
+    end
+
+    subgraph gpu[The GPU render engines]
+        backend[vivijure-backend<br/>RunPod cloud GPU:<br/>keyframes, image-to-video, LoRA training]
+        local12[vivijure-local-12gb<br/>your own 12GB card LTX]
+        local16[vivijure-local-16gb<br/>your own 16GB card CogVideoX]
+    end
+
+    subgraph finish[Finish helper engines]
+        musetalk[vivijure-musetalk<br/>lip-sync]
+        upscale[vivijure-upscale<br/>video upscale]
+        audioup[vivijure-audio-upscale<br/>audio cleanup]
+    end
+
+    discord --> slate
+    slate --> studio
+    ui --> studio
+    studio --> cloudmods
+    studio --> finishmods
+    studio --> audiomods
+    cloudmods --> backend
+    finishmods --> musetalk
+    finishmods --> upscale
+    audiomods --> audioup
+    studio --> backend
+    studio --> local12
+    studio --> local16
 ```
-   friends + Slate (Discord)
-            |
-            v
-        slate  -->  vivijure (studio control plane / JSON API)
-                        |
-                        v
-                  vivijure-backend (GPU render: keyframes -> i2v -> assemble)
-                        |
-            +-----------+-----------------------------+
-            |           |               |             |
-            v           v               v             v
-     vivijure-     vivijure-       vivijure-      (more finish
-     musetalk      upscale         audio-upscale   modules over time)
-   (lip-sync)    (video upscale)  (speech enhance)
+
+The full map, with a plain-English walk-through, is in [docs/constellation.md](docs/constellation.md).
+
+This engine runs late in the finish chain, raising a shot (or the assembled film) back to delivery
+resolution. It pairs with the [lip-sync engine](https://github.com/skyphusion-labs/vivijure-musetalk),
+which works a small face region and leans on this one to return to full size.
+
+## Deploy this finish engine
+
+You need a **RunPod** account (the GPU) and a **registry** to hold the image (like `ghcr.io`). Then:
+
+```bash
+cp deploy.env.example deploy.env   # then open deploy.env and fill in your keys
+./deploy.sh                        # safe to re-run
 ```
 
-| Repo | Role |
+The script builds the image, pushes it to your registry, creates the RunPod endpoint, and prints an
+**endpoint id**. It is idempotent (safe to re-run) and fails closed (stops on the first error). The
+full walk-through, with every setting explained, is in [docs/deploy.md](docs/deploy.md).
+
+**Pin a card with hardware video encode (NVENC).** This job needs NVENC and only a few GB of VRAM, not
+a giant card. An **Ada** card (**L4** or **L40S**) is the sweet spot; a **Blackwell RTX PRO 6000** also
+works. A faster card finishes in fewer billed seconds, so speed per dollar beats sticker price.
+
+## Turn it on in the studio
+
+This engine powers the studio's **finish-upscale** module. Once the endpoint is up:
+
+1. Copy the endpoint id the script printed.
+2. In your studio's `deploy.env`, set **`VIDEO_UPSCALE_RUNPOD_ENDPOINT_ID`** to that id.
+3. Keep `VIVIJURE_PROFILE=full` and re-run the studio's `./deploy.sh`.
+
+See the studio's [docs/opt-in-tiers.md](https://github.com/skyphusion-labs/vivijure/blob/main/docs/opt-in-tiers.md)
+(the "finish-upscale" entry).
+
+## The settings (knobs)
+
+Every setting is in `deploy.env`, and each one is explained in full (what it is, why, an example) in
+[docs/deploy.md](docs/deploy.md). In short:
+
+| Setting | What it does |
 |---|---|
-| [slate](https://github.com/skyphusion-labs/slate) | Collaborative AI screenwriter assistant for Discord. Friends and Slate co-author a film in-channel; Slate then submits it to the studio entirely through the vivijure JSON API. |
-| [vivijure](https://github.com/skyphusion-labs/vivijure) | The studio control plane (a Cloudflare Worker): planner, cast, and render UI plus the JSON API. A thin module host that orchestrates render jobs behind a typed hook contract. |
-| [vivijure-backend](https://github.com/skyphusion-labs/vivijure-backend) | The GPU render backend (RunPod serverless): SDXL keyframes, Wan image-to-video, and ffmpeg assembly. The half that turns a storyboard bundle into a film. |
-| [vivijure-musetalk](https://github.com/skyphusion-labs/vivijure-musetalk) | MuseTalk audio-driven lip-sync GPU module (finish-class). Syncs a character's mouth to dialogue audio. |
-| [vivijure-upscale](https://github.com/skyphusion-labs/vivijure-upscale) | Real-ESRGAN CUDA video-upscale GPU module (finish-class). Raises the assembled film's resolution. |
-| [vivijure-audio-upscale](https://github.com/skyphusion-labs/vivijure-audio-upscale) | CUDA speech-audio enhancement (resemble-enhance) GPU module. The GPU half of the cost-aware audio finish path. |
+| `RUNPOD_API_KEY` | Your RunPod key, so the script can make the endpoint. |
+| `IMAGE` | The image name to build, push, and run (point it at your own registry). |
+| `ENDPOINT_NAME` | A label for the endpoint (re-runs reuse it by this name). |
+| `GPU_TYPE_IDS` | Which GPU cards to pin (an NVENC-capable Ada L4 / L40S, or Blackwell). |
+| `CONTAINER_DISK_GB` | Disk for the container (default 20; the weights are only a few MB). |
+| `WORKERS_MIN` / `WORKERS_MAX` | Scaling bounds; min 0 = scale to zero = pay nothing when idle. |
+| `MAX_OUTPUT_LONG_EDGE` | Output size cap in px (default 3840 = 4K UHD). |
+| `FFMPEG_TIMEOUT` | Per-step wall-clock guard in seconds (default 1200). |
+| `UPSCALE_BATCH` | Frames upscaled at once (default 16); lower it on a smaller card. |
+| `UPSCALE_TILE` | Tile size in px (default 1024); trades VRAM for speed. |
+| `UPSCALE_FP16` | Half precision on (1) or off (0); default 1, effectively lossless. |
+| `CONTAINER_REGISTRY_AUTH_ID` | RunPod credential id, only if your image is private. |
+| `R2_ENDPOINT_URL` / `R2_BUCKET` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 keys for the studio's finish-chain mode (the endpoint reads/writes your bucket by key). |
 
-## Team
+Two per-job knobs the studio can pass: **`scale`** (default 2; `2` or `4`) and **`model`** (default
+`realesr-animevideov3`, fast and great for animation; `RealESRGAN_x4plus` is a general-purpose 4x).
 
-Vivijure is built by Conrad (`skyphusion`) and his named AI crew. The crew are treated as
-individuals, each working in their own lane with their own GitHub identity; this is the same
-transparent framing used across the project.
+## The job contract
+
+Three modes, so you know exactly what the endpoint does.
+
+- **R2 finish-chain mode:** `{ "clip_key": "...", "output_key": "...", "scale": 2,
+  "model": "realesr-animevideov3" }`.
+- **Presigned mode:** `{ "video_url": "...", "output_url": "...", "output_key": "...", "scale": 2 }`.
+- **Self-test:** `{ "selftest": true, "scale": 2 }` upscales a generated clip end to end and reports
+  the encoder used, GPU use, and timing, so you can prove a fresh endpoint is GPU-bound.
+
+A non-ok result is a soft-degrade signal (pass the original through), never a drop. The result names
+the encoder that ran, so a CPU fallback is never silent.
+
+## How it runs (GPU-bound by design)
+
+The pipeline keeps the GPU busy and the CPU out of the hot path: frames stream through ffmpeg pipes
+(no per-frame disk roundtrip), Real-ESRGAN runs on **batches** in half precision, the resize to the
+final size is a GPU step, and the re-encode uses **`h264_nvenc`** (hardware encode) when the card
+supports it. The output long edge is capped so a 4x of 1080p never blows up to 8K, and every ffmpeg
+step has a hard timeout so a bad clip degrades instead of hanging. The Real-ESRGAN weights
+(`realesr-animevideov3`, `RealESRGAN_x4plus`) are a few MB and are baked into the image.
+
+## Where the source came from
+
+This repository's source was **recovered from the published image**
+`ghcr.io/skyphusion-labs/vivijure-upscale:0.2.2`: the original was built on a since-terminated RunPod
+pod and was never committed, so the image was the only surviving copy. `handler.py` and
+`requirements.txt` are verbatim from that image; the `Dockerfile` is reconstructed from
+`docker history` (faithful, not byte-identical). The GPU-bound encode pipeline was added on top.
+
+## The team
+
+Vivijure is built by Conrad (`skyphusion`) and his named AI crew, each working in their own lane with
+their own GitHub identity.
 
 | Member | Role | GitHub |
 |---|---|---|
@@ -51,121 +158,11 @@ transparent framing used across the project.
 | Rollins | Backend / modules | [@skyphusion-rollins](https://github.com/skyphusion-rollins) |
 | Joan | Frontend / extraction | [@skyphusion-joan](https://github.com/skyphusion-joan) |
 
-## GPU-bound by design
-
-The whole pipeline keeps the GPU busy and the CPU out of the hot path:
-
-- **No disk roundtrip; batched fp16 inference.** Frames stream in/out via ffmpeg `rawvideo` pipes (no
-  per-frame PNG read/write), and Real-ESRGAN runs on BATCHES of frames (`UPSCALE_BATCH`) in fp16
-  (autocast). This is what keeps the GPU fed: the upscale phase went from ~25s at ~12% GPU util to
-  ~3.5s at 100% peak util on an RTX 6000 Ada (720p24x3s, 2x), a ~7x speedup, output unchanged.
-- **Inference + rescale on the GPU.** Real-ESRGAN runs on CUDA; the resize to the final frame size
-  (for a 2x request, and/or the resolution cap) is a GPU `interpolate`, not a CPU Lanczos pass.
-- **NVENC re-encode.** The final encode uses `h264_nvenc` (hardware encode) when the card + ffmpeg
-  support it. The encoder is probed once per worker (listed **and** a real test encode succeeds); if
-  NVENC is not usable, it falls back to a bounded `libx264` and **reports which encoder ran** in the
-  result (`encoder`), so a CPU fallback is never silent.
-- **Output resolution cap.** The models are 4x native, so a 4x of 1080p would be 8K (7680x4320). The
-  output long edge is capped (default **2160p / 4K UHD**, `MAX_OUTPUT_LONG_EDGE`) and a 2x request is
-  produced at 2x, so the encode and the in-memory frame buffers stay bounded regardless of source.
-- **Wall-clock guards.** Every ffmpeg phase has a hard timeout (`FFMPEG_TIMEOUT`, default 1200s). A
-  pathological clip degrades (ok:false -> the module passes the original through) instead of hanging
-  to the RunPod execution-timeout.
-
-History: `:0.2.5` moved the re-encode off CPU `libx264` onto `h264_nvenc` (the original ship-blocker --
-the encode pegged the CPU for minutes). `:0.2.6` then made the upscale loop itself GPU-bound by removing
-the per-frame PNG disk roundtrip and batching the inference in fp16 (issue #7).
-
-## Engine: CUDA Real-ESRGAN (not Vulkan/video2x)
-
-An earlier attempt wrapped [video2x](https://github.com/k4yt3x/video2x) (Vulkan). RunPod has no
-working Vulkan stack (proven 2026-06-20), so the engine was swapped to **Real-ESRGAN on PyTorch/CUDA
-via spandrel** -- the same Real-ESRGAN models, a CUDA engine instead of Vulkan. The transport
-contract and the `{"selftest": true}` harness are unchanged from that attempt.
-
-## Models
-
-The Real-ESRGAN weights are a few MB and are **baked into the image** (no network volume), pulled
-from xinntao's public releases:
-
-- `realesr-animevideov3` -- anime / fast (default).
-- `RealESRGAN_x4plus` -- general-purpose 4x.
-
-The models are 4x native; a requested `scale` of 2 is produced at 2x by a GPU downscale of the 4x
-inference output (no CPU Lanczos pass, no oversized intermediate on disk).
-
-## Job input
-
-R2 mode (the finish-chain module contract -- the endpoint reads/writes the shared bucket itself):
-
-```json
-{ "clip_key": "renders/<project>/clips/<shot>_i2v.mp4", "output_key": "...optional...",
-  "scale": 2, "model": "realesr-animevideov3" }
-```
-
-Presigned mode (credentialless -- the caller presigns R2):
-
-```json
-{ "video_url": "<presigned GET>", "output_url": "<presigned PUT>",
-  "output_key": "renders/<project>/clips/<shot>_up.mp4", "scale": 2, "model": "realesr-animevideov3" }
-```
-
-Self-test (no R2 -- confirms CUDA, loads the model, upscales a generated 720p24 x 3s clip end to end,
-and **proves the result is GPU-bound**):
-
-```json
-{ "selftest": true, "scale": 2 }
-```
-
-The self-test result reports `encoder` + `nvenc_used` (which encoder actually ran), `batch` + `fp16`
-(the inference settings used), `phase_s` (the decode / upscale / encode wall-clock split), `gpu_sample`
-(sampled GPU + NVENC utilization, max/avg), `peak_vram_mib`, and `input_res` / `output_res`.
-
-A non-ok result is a soft-degrade signal to the caller (pass the original through), never a drop.
-
-## Tunables (endpoint env)
-
-| Env | Default | Effect |
-|-----|---------|--------|
-| `MAX_OUTPUT_LONG_EDGE` | `3840` | Output long-edge cap in px (2160p / 4K UHD). Bounds worst-case wall-clock. |
-| `FFMPEG_TIMEOUT` | `1200` | Per-phase wall-clock guard (s). Exceeding it degrades the job, never hangs. |
-| `UPSCALE_BATCH` | `16` | Frames per GPU inference batch. Higher = better GPU saturation, more VRAM (B16/720p ~8.7 GiB, /1080p ~17 GiB). Lower it on a smaller card. |
-| `UPSCALE_TILE` | `1024` | Tile size (px) for the tiled inference. Larger = fewer kernel launches (higher util), more VRAM. |
-| `UPSCALE_FP16` | `1` | fp16 inference via autocast (set `0` for fp32). fp16 is effectively lossless here (PSNR ~66 dB vs fp32, max 1 LSB). |
-| `R2_ENDPOINT_URL` / `R2_BUCKET` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | -- | R2 mode credentials (set in the RunPod dashboard). |
-
-## RunPod GPU config (which card to pin the endpoint to)
-
-This is a **GPU-bound** module (batched fp16 Real-ESRGAN + NVENC), so the endpoint should be pinned
-to a card with hardware NVENC and enough VRAM for the batch -- not the cheapest card. Per the
-GPU-rationing thesis, a faster card finishes the job in fewer billed seconds, so speed-per-dollar
-wins over sticker price.
-
-- **Recommended:** an Ada / Blackwell-Pro card with NVENC -- e.g. **L4 / L40S (Ada, sm_89)** or
-  **RTX PRO 6000 (Blackwell, sm_120)**. The reference number in "GPU-bound by design" (~3.5s for a
-  720p24x3s 2x upscale at 100% util) is on an **RTX 6000 Ada**.
-- **VRAM vs batch:** size `UPSCALE_BATCH` to the card. B16 needs ~8.7 GiB at 720p, ~17 GiB at 1080p;
-  a 24 GiB card runs B16/1080p comfortably, a 16 GiB card should drop the batch. `UPSCALE_TILE`
-  trades VRAM for kernel-launch overhead the same way.
-- **Avoid:** cards without usable NVENC -- the encode then falls back to bounded `libx264` on CPU
-  (the result reports `encoder` so the fallback is never silent, but it is slower and off-thesis).
-- **Where it is set:** the GPU type is selected on the **RunPod endpoint** (dashboard / endpoint
-  config), not in this repo. The image is GPU-agnostic; torch kernels come from the
-  `runpod/pytorch` cu1281 base, so there is **no `TORCH_CUDA_ARCH_LIST` to maintain here** (unlike
-  the sibling musetalk image, which compiles mmcv CUDA ops and does pin an arch list). Endpoint env
-  + GPU + registry-auth are the deliberate, dashboard-set knobs (RunPod's API does not honor them).
-
-## Source provenance
-
-This repository's source was **recovered from the published image**
-`ghcr.io/skyphusion-labs/vivijure-upscale:0.2.2`: the original was built on a since-terminated RunPod
-pod and was never committed, so the image was the only surviving copy. `handler.py` and
-`requirements.txt` are verbatim from the image; the `Dockerfile` is reconstructed from
-`docker history` (functionally faithful, not byte-identical). The GPU-bound encode pipeline above
-(NVENC, resolution cap, GPU rescale, wall-clock guards) was added on top in `:0.2.3`.
-
 ## License
 
-**AGPL-3.0-only.** A labor of love, given freely: use it, learn from it, self-host it, build your own creative visions on it. Run it as a network service and the AGPL has you share your changes back, so it stays a commons. It is not for sale, and not to be resold as a SaaS.
+**AGPL-3.0-only.** A labor of love, given freely: use it, learn from it, self-host it, build your own
+creative visions on it. Run it as a network service and the AGPL has you share your changes back, so it
+stays a commons. It is not for sale, and not to be resold as a SaaS.
 
-Third-party components it incorporates (Real-ESRGAN -- BSD-3-Clause; spandrel -- MIT; FFmpeg) are listed in `THIRD_PARTY_NOTICES.md`.
+Third-party components it incorporates (Real-ESRGAN, BSD-3-Clause; spandrel, MIT; FFmpeg) are listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
