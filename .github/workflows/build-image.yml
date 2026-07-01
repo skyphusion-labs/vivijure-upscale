@@ -8,7 +8,7 @@ name: build-image
 # vivijure-backend/release.yml). Without it the docker build blows the runner disk.
 
 # RunPod serverless image build for vivijure-upscale (sibling of vivijure-musetalk).
-# Mirrors the musetalk build: on a push to master that touches the image inputs,
+# Mirrors the musetalk build: on a push to main that touches the image inputs,
 # build the Docker image and push it to GHCR as :latest + :<sha>. A pushed semver
 # tag (v0.2.3) additionally publishes :0.2.3 -- the release image the endpoint
 # template is pinned to. The endpoint template is re-pinned to the new image
@@ -19,7 +19,7 @@ name: build-image
 on:
   workflow_dispatch:
   push:
-    branches: [master]
+    branches: [main]
     paths:
       - Dockerfile
       - handler.py
