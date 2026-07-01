@@ -158,6 +158,12 @@ their own GitHub identity.
 | Rollins | Backend / modules | [@skyphusion-rollins](https://github.com/skyphusion-rollins) |
 | Joan | Frontend / extraction | [@skyphusion-joan](https://github.com/skyphusion-joan) |
 
+## Support
+
+Questions, bugs, or ideas? Start with this repo's [GitHub Issues](../../issues); see
+[SUPPORT.md](SUPPORT.md) for how to ask and what to include. Found a security problem? Report it
+privately per [SECURITY.md](SECURITY.md), never as a public issue.
+
 ## License
 
 **AGPL-3.0-only.** A labor of love, given freely: use it, learn from it, self-host it, build your own
