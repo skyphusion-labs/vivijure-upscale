@@ -37,7 +37,6 @@ import numpy as np
 import requests
 import runpod
 import torch
-from PIL import Image
 from spandrel import ModelLoader
 
 MODELS_DIR = "/models"

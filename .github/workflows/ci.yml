@@ -1,0 +1,36 @@
+name: ci
+
+# Minimal CI gate for this thin RunPod finish-module wrapper. There is nothing CPU-testable to cover:
+# the handler is a single wrapper whose heavy GPU/ML deps (torch, spandrel, boto3, runpod, ...) import
+# only on the card, so coverage would be fabricated. Instead this is a REAL error gate -- ruff catches
+# syntax (E9) and pyflakes errors (F: undefined names, unused imports), py_compile catches parse breaks.
+# Style noise (line length, quotes) is intentionally NOT selected so the gate is signal, not a nitpick wall.
+# Public repo -> GitHub-hosted ubuntu-latest (fork-safe), never the fleet pool.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least-privilege CI token: lint + compile only; never writes the repo, pushes an image, or needs a secret.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff (pinned for a deterministic gate)
+        run: pip install ruff==0.15.20
+      - name: Lint (real errors only -- E9 syntax + F pyflakes)
+        run: ruff check --select E9,F .
+      - name: Syntax-compile the handler
+        run: python -m py_compile handler.py
