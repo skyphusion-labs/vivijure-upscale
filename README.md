@@ -166,3 +166,5 @@ stays a commons. It is not for sale, and not to be resold as a SaaS.
 
 Third-party components it incorporates (Real-ESRGAN, BSD-3-Clause; spandrel, MIT; FFmpeg) are listed in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Licensed under AGPL-3.0-only. See [LICENSE](LICENSE).
