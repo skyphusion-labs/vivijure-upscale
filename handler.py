@@ -135,7 +135,7 @@ def _forward_tile(model, t, use_half):
         if "out of memory" not in str(e).lower():
             raise
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            torch.cuda.empty_cache()  # the failing forward left GiB reserved-but-unallocated (fragmentation); reclaim it before the retry
         n = t.shape[0]
         if n <= 1:
             raise

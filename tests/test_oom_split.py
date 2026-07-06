@@ -30,14 +30,21 @@ class FakeT:
         return self
 
 
+# The literal message captured from the real x4plus OOM (RunPod job aeb916d0, endpoint 4q8idwbk6tyqbq,
+# :0.2.8) -- the regression fixture, so the split trigger is tested against the exact production string.
+CAPTURED_OOM = ("CUDA out of memory. Tried to allocate 45.70 GiB. GPU 0 has a total capacity of "
+                "94.97 GiB of which 22.85 GiB is free.")
+
+
 def _stub_torch(max_batch):
-    """Install a torch stub whose model OOMs above max_batch; returns (torch_module, model)."""
+    """Install a torch stub whose model raises the captured CUDA OOM above max_batch; returns
+    (torch_module, model)."""
     calls = []
 
     def model(t):
         calls.append(t.n)
         if t.n > max_batch:
-            raise RuntimeError("CUDA out of memory. Tried to allocate 46.00 GiB")
+            raise RuntimeError(CAPTURED_OOM)
         return FakeT(t.n)
 
     model.calls = calls
