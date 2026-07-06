@@ -421,6 +421,34 @@ def _key_error(key, what, prefixes=("renders/",)):
     return None if ok else f"{what}: R2 key {k!r} must be a plain relative key under {' or '.join(prefixes)}"
 
 
+def _stamp_sidecar_r2(s3, output_key, output_hash):
+    """#583 provenance: write the core-computed param-hash to `<output_key>.hash` AFTER the artifact
+    (artifact first, sidecar last -- the only safe order; studio CONTRACT.md 3.3.1). Opaque: write the
+    value verbatim, never recompute it. Best-effort: a failed sidecar only disables reuse (the core
+    re-runs), it must NEVER fail a good render. No output_hash (legacy core) -> no sidecar."""
+    if not output_hash:
+        return
+    try:
+        s3.put_object(Bucket=R2_BUCKET, Key=f"{output_key}.hash",
+                      Body=str(output_hash).encode("utf-8"), ContentType="text/plain")
+    except Exception:  # noqa: BLE001 -- provenance is best-effort; a miss = safe re-run, never a failed render
+        pass
+
+
+def _stamp_sidecar_presigned(hash_url, output_hash):
+    """Presigned-mode sidecar stamp: the credentialless handler writes the `.hash` only if the core
+    presigned a `hash_url`. Prod finish uses R2 mode (this is a no-op there); a presigned deployment gets
+    provenance once the core presigns hash_url. Same opaque + best-effort contract."""
+    if not (hash_url and output_hash):
+        return
+    try:
+        body = str(output_hash).encode("utf-8")
+        requests.put(hash_url, data=body, timeout=UPLOAD_TIMEOUT,
+                     headers={"content-type": "text/plain", "content-length": str(len(body))}).raise_for_status()
+    except Exception:  # noqa: BLE001 -- best-effort provenance; a miss = safe re-run
+        pass
+
+
 def _upscale_r2(inp):
     """R2 mode: download clip_key, upscale, upload output_key in the shared bucket; return the new key as
     `clip_key` so the finish chain passes the upscaled clip downstream."""
@@ -448,6 +476,7 @@ def _upscale_r2(inp):
         if not os.path.getsize(dst):
             return {"ok": False, "error": "upscale produced no output"}
         s3.upload_file(dst, R2_BUCKET, output_key, ExtraArgs={"ContentType": "video/mp4"})
+        _stamp_sidecar_r2(s3, output_key, inp.get("output_hash"))  # #583: sidecar AFTER the artifact
         return {"ok": True, "clip_key": output_key, "bytes": os.path.getsize(dst),
                 "scale": final_scale, "model": model_name, "frames": info["frames"],
                 "encoder": info["encoder"], "applied": [f"upscale:{final_scale}x"]}
@@ -487,6 +516,7 @@ def handler(job):
             put = requests.put(output_url, data=f, timeout=UPLOAD_TIMEOUT,
                                headers={"content-type": "video/mp4", "content-length": str(size)})
         put.raise_for_status()
+        _stamp_sidecar_presigned(inp.get("hash_url"), inp.get("output_hash"))  # #583: sidecar AFTER the artifact
         return {"ok": True, "output_key": output_key, "bytes": size,
                 "scale": final_scale, "model": model_name, "frames": info["frames"],
                 "encoder": info["encoder"]}
