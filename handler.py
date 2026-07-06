@@ -46,7 +46,9 @@ MODEL_FILES = {
 }
 DOWNLOAD_TIMEOUT = 900
 UPLOAD_TIMEOUT = 900
-TILE = int(os.environ.get("UPSCALE_TILE", "1024") or "1024")  # tile size (px); env-tunable -- bounds GPU memory per tile pass
+TILE = int(os.environ.get("UPSCALE_TILE", "512") or "512")  # tile size (px); env-tunable -- bounds GPU memory per tile pass.
+# 512 genuinely subdivides a 720p frame (1280x720 -> 6 tiles); a value >= the frame size makes tiling a
+# no-op, which is how a heavy 4x model (RealESRGAN_x4plus RRDB) hit OOM on a full-frame batch (#584 sib).
 TILE_PAD = 16   # tile overlap to hide seams
 # Frames per GPU batch: the model runs on (N,3,h,w) at once instead of a one-at-a-time Python loop, so
 # the per-frame launch/Python overhead is amortized and the GPU stays fed. Tune against VRAM.
@@ -119,6 +121,30 @@ def _load_model(name):
     return _MODELS[name]
 
 
+def _forward_tile(model, t, use_half):
+    """Run the model on one (N,3,h,w) tile and return (N,3,h*scale,w*scale), SPLITTING the batch on a
+    CUDA out-of-memory error so a heavy model can never hard-OOM. A native-4x RRDB model (x4plus) on a
+    16-frame batch of a near-full-frame tile allocated ~46 GiB in one forward and failed every real job
+    (#584 sib); tiling bounds the spatial size, this bounds the batch multiple. On OOM: free the cache
+    and recurse on halves, down to a single frame. A lone frame that still cannot fit re-raises (the
+    caller has already shrunk the tile as far as TILE allows)."""
+    try:
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_half):
+            return model(t).float()
+    except RuntimeError as e:  # torch.cuda.OutOfMemoryError is a RuntimeError subclass; match both
+        if "out of memory" not in str(e).lower():
+            raise
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        n = t.shape[0]
+        if n <= 1:
+            raise
+        mid = n // 2
+        a = _forward_tile(model, t[:mid], use_half)
+        b = _forward_tile(model, t[mid:], use_half)
+        return torch.cat([a, b], dim=0)
+
+
 @torch.inference_mode()
 def _upscale_batch(model, frames_np, out_w, out_h):
     """Upscale a BATCH of same-size frames on the GPU, tiled to bound memory, then GPU-resize to
@@ -135,9 +161,7 @@ def _upscale_batch(model, frames_np, out_w, out_h):
         for x in range(0, w, TILE):
             y0, x0 = max(y - TILE_PAD, 0), max(x - TILE_PAD, 0)
             y1, x1 = min(y + TILE + TILE_PAD, h), min(x + TILE + TILE_PAD, w)
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_half):
-                ot = model(t[:, :, y0:y1, x0:x1])  # (N,3,th,tw) -> (N,3,th*s,tw*s)
-            ot = ot.float()
+            ot = _forward_tile(model, t[:, :, y0:y1, x0:x1], use_half)  # (N,3,th,tw) -> (N,3,th*s,tw*s); OOM-safe
             cy1, cx1 = min(y + TILE, h), min(x + TILE, w)
             sy, sx = (y - y0) * scale, (x - x0) * scale
             th, tw = (cy1 - y) * scale, (cx1 - x) * scale
@@ -335,12 +359,24 @@ class _GpuSampler(threading.Thread):
 
 
 def _selftest(inp):
-    """Self-contained GPU verification -- NO R2 needed. Confirms CUDA + loads the model, generates a real
-    multi-second clip, upscales it end to end, and PROVES the result is GPU-bound: it reports which encoder
-    actually ran (asserting NVENC where expected), the per-phase wall-clock split, sampled GPU/encoder
-    utilization + peak VRAM, and the batch/fp16 settings. Trigger with {"selftest": true}."""
-    model_name = str(inp.get("model", "realesr-animevideov3"))
+    """Deploy verification. With an explicit `model`, run just that one (back-compat). WITHOUT a model,
+    SWEEP every shipped model so a heavy model (RealESRGAN_x4plus) is exercised on silicon at a realistic
+    frame count, not only the default -- the S24 gap that let an x4plus OOM ship silent (#584 sib). ok is
+    true only when EVERY swept model passed. Trigger with {"selftest": true} (+ optional model / scale)."""
     final_scale = 4 if int(inp.get("scale", 2) or 2) >= 4 else 2
+    requested = inp.get("model")
+    if requested:
+        return _selftest_one(str(requested), final_scale)
+    names = list(MODEL_FILES.keys())
+    models = {n: _selftest_one(n, final_scale) for n in names}
+    return {"ok": all(m.get("ok") for m in models.values()), "selftest": True, "swept": names,
+            "scale": final_scale, "cuda_available": torch.cuda.is_available(), "models": models}
+
+
+def _selftest_one(model_name, final_scale):
+    """End-to-end GPU selftest for ONE model at a target scale (NO R2). Loads the model, generates a real
+    multi-second clip, upscales it, and reports the encoder used, per-phase wall-clock, sampled GPU/encoder
+    utilization + peak VRAM, and the batch/fp16 settings. Returns the per-model result dict."""
     out = {"ok": False, "selftest": True, "torch_version": torch.__version__,
            "cuda_available": torch.cuda.is_available()}
     work = tempfile.mkdtemp(prefix="selftest-")
