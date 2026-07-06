@@ -34,3 +34,7 @@ jobs:
         run: ruff check --select E9,F .
       - name: Syntax-compile the handler
         run: python -m py_compile handler.py
+      - name: Install pytest (#583 sidecar unit coverage; heavy deps stubbed, no GPU)
+        run: pip install pytest==9.1.1
+      - name: Unit tests (provenance-sidecar stamp routing)
+        run: python -m pytest -q tests/
