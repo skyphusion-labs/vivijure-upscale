@@ -86,11 +86,15 @@ you set them). The defaults are good for most cards.
 - **`FFMPEG_TIMEOUT`** (default `1200`) -- a per-step wall-clock guard, in seconds. Why: a pathological
   clip degrades (passes the original through) instead of hanging. Example: `FFMPEG_TIMEOUT=1200`.
 - **`UPSCALE_BATCH`** (default `16`) -- how many frames the GPU upscales at once. Why: bigger batches
-  keep the GPU busier but use more VRAM (16 needs about 8.7GB at 720p, about 17GB at 1080p). Lower it
-  on a smaller card. Example: `UPSCALE_BATCH=8` on a 16GB card.
-- **`UPSCALE_TILE`** (default `1024`) -- the tile size, in pixels, the model works in. Why: larger
-  tiles mean fewer GPU launches (faster) but more VRAM. It trades memory for speed like the batch does.
-  Example: `UPSCALE_TILE=1024`.
+  keep the GPU busier but use more VRAM. Lower it on a smaller card. On a CUDA out-of-memory the handler
+  automatically splits the batch (halving down to a single frame, freeing the cache between tries) and
+  retries, so a heavy model can never hard-OOM -- worst case it runs one frame per tile (slow, correct).
+  Example: `UPSCALE_BATCH=8` on a 16GB card.
+- **`UPSCALE_TILE`** (default `512`) -- the tile size, in pixels, the model works in. Why: larger
+  tiles mean fewer GPU launches (faster) but more VRAM. It MUST be smaller than the frame or tiling is a
+  no-op and the whole frame runs in one forward -- that is how a native-4x model (RealESRGAN_x4plus, a
+  heavy RRDB) ran a full-frame 16-frame batch and hit CUDA OOM. 512 genuinely subdivides a 720p frame.
+  Example: `UPSCALE_TILE=512`.
 - **`UPSCALE_FP16`** (default `1`) -- run in half precision (`1`) or full precision (`0`). Why: half
   precision is about twice as memory-friendly and effectively lossless here (about 66 dB versus full,
   which is imperceptible). Example: `UPSCALE_FP16=1`.
@@ -117,7 +121,9 @@ here is the contract.
 - **Presigned mode:** `{ "video_url": "...", "output_url": "...", "output_key": "...", "scale": 2 }`.
   The studio presigns the links; the endpoint holds no keys.
 - **Self-test:** `{ "selftest": true, "scale": 2 }`. Upscales a generated clip end to end and reports
-  which encoder ran, the GPU use, and the timing, so you can prove a fresh endpoint is GPU-bound.
+  which encoder ran, the GPU use, and the timing, so you can prove a fresh endpoint is GPU-bound. With no
+  `model` it SWEEPS every shipped model on the real GPU (so a heavy model like `RealESRGAN_x4plus` is
+  verified, not just the default); `ok` is true only when every model passed. Run this before you repin.
 
 Two job knobs you can pass:
 

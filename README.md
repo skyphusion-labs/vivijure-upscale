@@ -106,8 +106,8 @@ Every setting is in `deploy.env`, and each one is explained in full (what it is,
 | `WORKERS_MIN` / `WORKERS_MAX` | Scaling bounds; min 0 = scale to zero = pay nothing when idle. |
 | `MAX_OUTPUT_LONG_EDGE` | Output size cap in px (default 3840 = 4K UHD). |
 | `FFMPEG_TIMEOUT` | Per-step wall-clock guard in seconds (default 1200). |
-| `UPSCALE_BATCH` | Frames upscaled at once (default 16); lower it on a smaller card. |
-| `UPSCALE_TILE` | Tile size in px (default 1024); trades VRAM for speed. |
+| `UPSCALE_BATCH` | Frames upscaled at once (default 16); lower it on a smaller card. On a CUDA out-of-memory the handler auto-splits the batch (down to 1 frame) and retries, so a heavy model never hard-fails. |
+| `UPSCALE_TILE` | Tile size in px (default 512); trades VRAM for speed. Keep it below the frame size so tiling actually subdivides -- a heavy 4x model (RealESRGAN_x4plus) needs this to fit. |
 | `UPSCALE_FP16` | Half precision on (1) or off (0); default 1, effectively lossless. |
 | `CONTAINER_REGISTRY_AUTH_ID` | RunPod credential id, only if your image is private. |
 | `R2_ENDPOINT_URL` / `R2_BUCKET` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 keys for the studio's finish-chain mode (the endpoint reads/writes your bucket by key). |
@@ -123,7 +123,9 @@ Three modes, so you know exactly what the endpoint does.
   "model": "realesr-animevideov3" }`.
 - **Presigned mode:** `{ "video_url": "...", "output_url": "...", "output_key": "...", "scale": 2 }`.
 - **Self-test:** `{ "selftest": true, "scale": 2 }` upscales a generated clip end to end and reports
-  the encoder used, GPU use, and timing, so you can prove a fresh endpoint is GPU-bound.
+  the encoder used, GPU use, and timing, so you can prove a fresh endpoint is GPU-bound. With no `model`
+  it SWEEPS every shipped model (so a heavy model like `RealESRGAN_x4plus` is verified on the real GPU,
+  not just the default); pass `"model": "..."` to test one. `ok` is true only when every swept model passed.
 
 Both work modes also accept an optional **`output_hash`** (a 64-char hex string the studio computes over
 the step's inputs, #583). When present, the handler writes it VERBATIM to `<output_key>.hash` AFTER the

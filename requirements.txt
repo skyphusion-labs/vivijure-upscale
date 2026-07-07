@@ -1,6 +1,23 @@
-spandrel
-pillow
-numpy
-requests
-runpod
-boto3
+# Pinned to the resolved set of the PROVEN-GOOD :0.2.8 image (issue #27), so the v0.2.9 bake is the
+# first reproducible upscale image. Versions are from `pip freeze` of
+# ghcr.io/skyphusion-labs/vivijure-upscale:0.2.8, which serves prod clean (animevideov3 finish + R2
+# sidecar stamps on take-2). Unpinned deps were the reason :0.2.6 and :0.2.8 could resolve differently
+# from identical source; this closes that reproducibility gap. It was NOT the OOM cause (that is the
+# x4plus RRDB batch/tile envelope, fixed in handler.py).
+#
+# torch / torchvision / torchaudio are deliberately NOT pinned here: they are provided by the base
+# image (runpod/pytorch cu1281 torch280); pinning the cu128 wheels in requirements would fight the base.
+#
+# botocore is pinned explicitly. 1.43.41 is >= 1.36 (the release train that made request-integrity
+# checksums a default), YET its R2 upload/download works fine in this stack (empirically: take-2 stamped
+# sidecars clean on :0.2.8). So the botocore-checksum-vs-R2 incompatibility does NOT apply here and NO
+# AWS_*_CHECKSUM opt-out is added. The pin exists for reproducibility, not to dodge a checksum default.
+spandrel==0.4.2
+pillow==11.0.0
+numpy==2.1.2
+requests==2.32.5
+runpod==1.10.0
+boto3==1.43.41
+botocore==1.43.41
+s3transfer==0.19.0
+urllib3==2.5.0
