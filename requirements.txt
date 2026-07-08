@@ -14,7 +14,7 @@
 # AWS_*_CHECKSUM opt-out is added. The pin exists for reproducibility, not to dodge a checksum default.
 spandrel==0.4.2
 pillow==12.3.0
-numpy==2.1.2
+numpy==2.5.1
 requests==2.33.0
 runpod==1.10.1
 boto3==1.43.41
