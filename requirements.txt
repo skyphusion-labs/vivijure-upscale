@@ -13,7 +13,7 @@
 # sidecars clean on :0.2.8). So the botocore-checksum-vs-R2 incompatibility does NOT apply here and NO
 # AWS_*_CHECKSUM opt-out is added. The pin exists for reproducibility, not to dodge a checksum default.
 spandrel==0.4.2
-pillow==12.2.0
+pillow==12.3.0
 numpy==2.1.2
 requests==2.33.0
 runpod==1.10.1
