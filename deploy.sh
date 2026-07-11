@@ -116,7 +116,8 @@ import json,os
 # endpoint env: R2 finish-chain creds plus any handler tuning knobs you set in deploy.env.
 env={}
 for k in ("R2_ENDPOINT_URL","R2_BUCKET","R2_ACCESS_KEY_ID","R2_SECRET_ACCESS_KEY",
-          "MAX_OUTPUT_LONG_EDGE","FFMPEG_TIMEOUT","UPSCALE_BATCH","UPSCALE_TILE","UPSCALE_FP16"):
+          "MAX_OUTPUT_LONG_EDGE","FFMPEG_TIMEOUT","UPSCALE_BATCH","UPSCALE_TILE","UPSCALE_TILE_FLOOR",
+          "UPSCALE_FP16","PYTORCH_CUDA_ALLOC_CONF"):
     v=os.environ.get(k,"")
     if v: env[k]=v
 b={"name":os.environ["TPL_NAME"],"imageName":os.environ["IMAGE"],"isServerless":True,
@@ -168,6 +169,39 @@ print(json.dumps(b))
   EP_ID="$(api POST /endpoints "$EP_BODY" | pyget id)"
   [ -n "$EP_ID" ] || die "could not read the new endpoint id"
   info "created endpoint $EP_ID"
+fi
+
+# ---- 3c. optional post-deploy verify: run the selftest sweep on the live endpoint ----
+# OFF by default (set VERIFY=1 to opt in) because it spends GPU seconds. When on, it submits the
+# model-less sweep selftest ({"selftest": true}) -- which exercises EVERY shipped model on the real
+# card AND the R2 finish-contract round-trip (#26) -- and FAILS CLOSED if the sweep is not ok. The R2
+# leg is REQUIRED only when this endpoint has R2 creds set (else its honest-skip is expected, not a
+# failure). Tune the poll ceiling with VERIFY_TIMEOUT (default 900s).
+VERIFY="${VERIFY:-0}"
+if [ "$VERIFY" = "1" ]; then
+  say "Step 3c/4: verify -- running the selftest sweep on $EP_ID (VERIFY=1)"
+  RUN_API="https://api.runpod.ai/v2/$EP_ID"
+  if [ -n "${R2_ENDPOINT_URL:-}" ] && [ -n "${R2_ACCESS_KEY_ID:-}" ]; then R2REQ=true; else R2REQ=false; fi
+  info "R2 leg required: $R2REQ (true only when R2 creds are set on this endpoint)"
+  JOB_ID="$(curl -fsS -X POST "${AUTH[@]}" -d "{\"input\":{\"selftest\":true,\"scale\":4,\"r2\":$R2REQ}}" "$RUN_API/run" | pyget id)"
+  [ -n "$JOB_ID" ] || die "verify: could not submit the selftest job"
+  VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-900}"
+  info "submitted selftest job $JOB_ID; polling up to ${VERIFY_TIMEOUT}s"
+  deadline=$(( $(date +%s) + VERIFY_TIMEOUT ))
+  RESP=""
+  while : ; do
+    RESP="$(curl -fsS "${AUTH[@]}" "$RUN_API/status/$JOB_ID" || true)"
+    STATUS="$(printf '%s' "$RESP" | pyget status)"
+    case "$STATUS" in
+      COMPLETED) break ;;
+      FAILED|CANCELLED|TIMED_OUT) die "verify: selftest job $STATUS -- $RESP" ;;
+    esac
+    [ "$(date +%s)" -lt "$deadline" ] || die "verify: selftest did not finish within ${VERIFY_TIMEOUT}s"
+    sleep 5
+  done
+  OK="$(printf '%s' "$RESP" | python3 -c 'import sys,json;d=json.load(sys.stdin);print("1" if (d.get("output") or {}).get("ok") else "0")' 2>/dev/null || echo 0)"
+  [ "$OK" = "1" ] || die "verify: selftest sweep did NOT pass -- full result: $RESP"
+  info "verify PASSED: selftest sweep ok (every model + the R2 leg)"
 fi
 
 # ---- 4. done: how to wire it into the studio --------------------------------

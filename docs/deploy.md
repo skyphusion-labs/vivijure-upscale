@@ -74,6 +74,11 @@ means and why.
   the image. Leave blank if you already ran `docker login`.
 - **`SKIP_BUILD`** (default `0`) -- set `1` to skip build and push and reuse an image already pushed.
   **`SKIP_ENDPOINT`** (default `0`) -- set `1` to stop after pushing the image (no endpoint).
+- **`VERIFY`** (default `0`) -- set `1` to run a post-deploy health check: the script submits the sweep
+  self-test to the live endpoint and FAILS CLOSED unless it comes back ok. Why: it proves the freshly
+  deployed image actually upscales on the card (every shipped model, plus the R2 finish round-trip when R2
+  creds are set) before you repin. It spends a little GPU time, so it is off by default. `VERIFY_TIMEOUT`
+  (default `900`) caps how long it polls, in seconds. Example: `VERIFY=1`.
 
 ### The upscaler's own tuning knobs
 
@@ -94,10 +99,24 @@ you set them). The defaults are good for most cards.
   tiles mean fewer GPU launches (faster) but more VRAM. It MUST be smaller than the frame or tiling is a
   no-op and the whole frame runs in one forward -- that is how a native-4x model (RealESRGAN_x4plus, a
   heavy RRDB) ran a full-frame 16-frame batch and hit CUDA OOM. 512 genuinely subdivides a 720p frame.
-  Example: `UPSCALE_TILE=512`.
+  **Card sizing:** `RealESRGAN_x4plus` at the default `512` tile wants a large card (>= ~80 GB); on a
+  smaller card (~48 GB class) set `UPSCALE_TILE=256`. If a single frame still will not fit, the handler
+  now auto-shrinks the tile too (see `UPSCALE_TILE_FLOOR`). The fast `realesr-animevideov3` model is fine
+  on small cards at the default. Example: `UPSCALE_TILE=512` (or `256` on a smaller card).
 - **`UPSCALE_FP16`** (default `1`) -- run in half precision (`1`) or full precision (`0`). Why: half
   precision is about twice as memory-friendly and effectively lossless here (about 66 dB versus full,
   which is imperceptible). Example: `UPSCALE_FP16=1`.
+- **`UPSCALE_TILE_FLOOR`** (default `64`) -- the smallest tile the auto-shrink fallback will drop to, in
+  pixels. Why: when the batch split has already reached a single frame and that frame STILL will not fit
+  (a card too small for one frame at `UPSCALE_TILE` through a heavy 4x model), the handler halves the tile
+  and retries, down to this floor, so the frame still upscales (slower, correct) instead of hard-failing.
+  Raise it if the smallest tiles are too slow; lower it only on a very tight card. Example:
+  `UPSCALE_TILE_FLOOR=64`.
+- **`PYTORCH_CUDA_ALLOC_CONF`** (default `expandable_segments:True`) -- how PyTorch grows its CUDA memory
+  pool. Why: `expandable_segments:True` lets the allocator grow and release segments instead of stranding
+  reserved-but-unused VRAM as fragmentation, which is what filled the card at the edge of the x4plus fit;
+  it drops the total footprint well under the raw allocation peak. The handler sets this before it loads
+  PyTorch; set your own value here to override it. Example: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
 
 ### The endpoint's own settings (R2 mode)
 
@@ -123,7 +142,11 @@ here is the contract.
 - **Self-test:** `{ "selftest": true, "scale": 2 }`. Upscales a generated clip end to end and reports
   which encoder ran, the GPU use, and the timing, so you can prove a fresh endpoint is GPU-bound. With no
   `model` it SWEEPS every shipped model on the real GPU (so a heavy model like `RealESRGAN_x4plus` is
-  verified, not just the default); `ok` is true only when every model passed. Run this before you repin.
+  verified, not just the default) AND runs the R2 finish-contract round-trip (the real bucket
+  download+upload path, #26). The R2 leg is opportunistic: it HONEST-SKIPS when the endpoint has no R2
+  creds (reported, never a silent pass); pass `"r2": true` to REQUIRE it (absent creds then fail). `ok`
+  is true only when every model passed and the R2 leg did not fail. Run this before you repin (or just set
+  `VERIFY=1` on the deploy).
 
 Two job knobs you can pass:
 
