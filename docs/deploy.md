@@ -146,7 +146,10 @@ here is the contract.
   download+upload path, #26). The R2 leg is opportunistic: it HONEST-SKIPS when the endpoint has no R2
   creds (reported, never a silent pass); pass `"r2": true` to REQUIRE it (absent creds then fail). `ok`
   is true only when every model passed and the R2 leg did not fail. Run this before you repin (or just set
-  `VERIFY=1` on the deploy).
+  `VERIFY=1` on the deploy). The result reports the tile each run settled on (`tile`, `tile_min`,
+  `tile_shrank`) and peak VRAM per model; pass `res` (a `WxH` clip size) and `dur` (seconds) to size the
+  generated test clip -- a large `res` paired with a large `UPSCALE_TILE` exercises the tile-shrink
+  fallback on a small card.
 
 Two job knobs you can pass:
 

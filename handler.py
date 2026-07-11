@@ -125,6 +125,19 @@ def _capped(w, h, max_edge):
     return w - (w % 2), h - (h % 2)
 
 
+def _parse_res(res):
+    """Parse a selftest "WxH" resolution string to even (w,h); fall back to 720p on anything malformed or
+    out of a sane 16..7680 range. Used only by the selftest harness (never the job path)."""
+    try:
+        ws, hs = str(res).lower().split("x")
+        w, h = int(ws), int(hs)
+        if 16 <= w <= 7680 and 16 <= h <= 7680:
+            return w - (w % 2), h - (h % 2)
+    except Exception:  # noqa: BLE001 -- bad input just falls back to the default
+        pass
+    return 1280, 720
+
+
 def _load_model(name):
     name = name if name in MODEL_FILES else "realesr-animevideov3"
     if name not in _MODELS:
@@ -196,22 +209,25 @@ def _tile_pass(model, t, scale, tile, use_half):
 @torch.inference_mode()
 def _upscale_batch(model, frames_np, out_w, out_h):
     """Upscale a BATCH of same-size frames on the GPU, tiled to bound memory, then GPU-resize to
-    (out_w,out_h). `frames_np` is a list of (h,w,3) uint8 arrays; returns an (N,out_h,out_w,3) uint8
-    array. fp16 via autocast when enabled. Starts at TILE and, on a single-frame CUDA OOM, shrinks the
+    (out_w,out_h). `frames_np` is a list of (h,w,3) uint8 arrays; returns ((N,out_h,out_w,3) uint8 array,
+    tile_used). fp16 via autocast when enabled. Starts at TILE and, on a single-frame CUDA OOM, shrinks the
     tile (halving down to TILE_FLOOR) so a small card still finishes (#30). No disk, no per-frame round-trip."""
     cuda = torch.cuda.is_available()
     scale = getattr(model, "scale", 4)
     arr = np.stack(frames_np).astype(np.float32) / 255.0      # (N,h,w,3)
     t = torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous().to(_device())  # (N,3,h,w)
     use_half = HALF and cuda
-    out = _shrink_on_oom(lambda tile: _tile_pass(model, t, scale, tile, use_half),
-                         TILE, TILE_FLOOR,
+    used = {"tile": TILE}  # the tile the successful pass settled on (records a shrink for the report)
+    def _pass(tile):
+        used["tile"] = tile
+        return _tile_pass(model, t, scale, tile, use_half)
+    out = _shrink_on_oom(_pass, TILE, TILE_FLOOR,
                          cleanup=(torch.cuda.empty_cache if cuda else None))
     if out.shape[-1] != out_w or out.shape[-2] != out_h:
         out = torch.nn.functional.interpolate(
             out, size=(out_h, out_w), mode="bicubic", align_corners=False, antialias=True)
     out = out.clamp(0, 1).mul_(255.0).add_(0.5).permute(0, 2, 3, 1).to(torch.uint8)
-    return out.cpu().numpy()  # (N,out_h,out_w,3)
+    return out.cpu().numpy(), used["tile"]  # (N,out_h,out_w,3), tile the pass settled on
 
 
 def _ffprobe(path, entries):
@@ -282,10 +298,12 @@ def _upscale_video(model, src, dst, final_scale):
 
     # --- upscale (GPU, batched) -- drop each input batch as it is consumed to bound peak RAM ---
     outputs = []
+    tile_min = TILE  # smallest tile any batch settled on; < TILE means the shrink fallback fired (#30)
     for i in range(0, len(inputs), BATCH):
         chunk = inputs[i:i + BATCH]
         frames_np = [np.frombuffer(b, dtype=np.uint8).reshape(sh, sw, 3) for b in chunk]
-        outs = _upscale_batch(model, frames_np, out_w, out_h)  # (n,out_h,out_w,3) uint8
+        outs, tile_used = _upscale_batch(model, frames_np, out_w, out_h)  # (n,out_h,out_w,3) uint8, tile
+        tile_min = min(tile_min, tile_used)
         outputs.extend(np.ascontiguousarray(f).tobytes() for f in outs)
         for j in range(i, min(i + BATCH, len(inputs))):
             inputs[j] = None
@@ -325,6 +343,7 @@ def _upscale_video(model, src, dst, final_scale):
         "upscale_s": round(t2 - t1, 2),
         "encode_s": round(t3 - t2, 2),
         "batch": BATCH, "fp16": bool(HALF and torch.cuda.is_available()),
+        "tile": TILE, "tile_min": tile_min, "tile_shrank": tile_min < TILE,
     }
 
 
@@ -407,19 +426,22 @@ def _selftest(inp):
     verified, not just the baked-sample path (#26): OPPORTUNISTIC -- it HONEST-SKIPS when R2 creds are
     absent (r2.ok = None, r2.skipped set) and does NOT fail the sweep -- UNLESS the caller passes
     `"r2": true`, which REQUIRES it (absent creds then FAIL). ok is true only when EVERY swept model
-    passed AND the R2 leg did not fail. Trigger with {"selftest": true} (+ optional model / scale / r2)."""
+    passed AND the R2 leg did not fail. Trigger with {"selftest": true} (+ optional model / scale / r2,
+    plus res "WxH" and dur seconds for the generated test clip -- a large res paired with a large
+    UPSCALE_TILE drives the #30 tile-shrink on a small card)."""
     final_scale = 4 if int(inp.get("scale", 2) or 2) >= 4 else 2
     r2_requested = bool(inp.get("r2"))
+    res, dur = str(inp.get("res", "1280x720")), inp.get("dur", 3)
     requested = inp.get("model")
     if requested:
-        result = _selftest_one(str(requested), final_scale)
+        result = _selftest_one(str(requested), final_scale, res, dur)
         if r2_requested:
             r2 = _selftest_r2(final_scale, str(requested), requested=True)
             result["r2"] = r2
             result["ok"] = bool(result.get("ok")) and r2.get("ok") is not False
         return result
     names = list(MODEL_FILES.keys())
-    models = {n: _selftest_one(n, final_scale) for n in names}
+    models = {n: _selftest_one(n, final_scale, res, dur) for n in names}
     # R2 leg uses the fast model (the round-trip proves the boto3 path, not model weight; the sweep above
     # already exercises the heavy x4plus on silicon).
     r2 = _selftest_r2(final_scale, names[0], requested=r2_requested)
@@ -428,10 +450,12 @@ def _selftest(inp):
             "cuda_available": torch.cuda.is_available(), "models": models, "r2": r2}
 
 
-def _selftest_one(model_name, final_scale):
+def _selftest_one(model_name, final_scale, res="1280x720", dur=3):
     """End-to-end GPU selftest for ONE model at a target scale (NO R2). Loads the model, generates a real
-    multi-second clip, upscales it, and reports the encoder used, per-phase wall-clock, sampled GPU/encoder
-    utilization + peak VRAM, and the batch/fp16 settings. Returns the per-model result dict."""
+    multi-second clip at `res` (WxH) for `dur` seconds, upscales it, and reports the encoder used, per-phase
+    wall-clock, sampled GPU/encoder utilization + peak VRAM, the batch/fp16 settings, and the tile the run
+    settled on (tile_min < tile means the #30 shrink fallback fired -- driveable on a small card by pairing
+    a large res with a large UPSCALE_TILE). Returns the per-model result dict."""
     out = {"ok": False, "selftest": True, "torch_version": torch.__version__,
            "cuda_available": torch.cuda.is_available()}
     work = tempfile.mkdtemp(prefix="selftest-")
@@ -444,10 +468,13 @@ def _selftest_one(model_name, final_scale):
         out["nvenc_available"] = _nvenc_available()
         model = _load_model(model_name)
         out["model"], out["model_scale"] = model_name, getattr(model, "scale", 4)
-        # A real multi-second clip (720p24 x 3s = 72 frames) so the GPU work and encode are non-trivial.
+        gw, gh = _parse_res(res)
+        dur = max(1, min(int(dur or 3), 30))
+        out["requested_res"], out["requested_dur"] = f"{gw}x{gh}", dur
+        # A real multi-second clip (default 720p24 x 3s = 72 frames) so the GPU work + encode are non-trivial.
         gen = subprocess.run(
             ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
-             "-i", "testsrc=size=1280x720:rate=24:duration=3", "-pix_fmt", "yuv420p", src],
+             "-i", f"testsrc=size={gw}x{gh}:rate=24:duration={dur}", "-pix_fmt", "yuv420p", src],
             capture_output=True, text=True,
         )
         if gen.returncode != 0:
@@ -467,6 +494,8 @@ def _selftest_one(model_name, final_scale):
         out["encoder"] = info["encoder"]
         out["nvenc_used"] = info["encoder"] == "h264_nvenc"
         out["batch"], out["fp16"] = info["batch"], info["fp16"]
+        out["tile"], out["tile_min"] = info["tile"], info["tile_min"]
+        out["tile_shrank"] = info["tile_shrank"]
         out["phase_s"] = {"extract": info["extract_s"], "upscale": info["upscale_s"],
                           "encode": info["encode_s"]}
         out["gpu_sample"] = sampler.stats()

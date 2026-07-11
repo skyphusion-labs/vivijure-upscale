@@ -123,7 +123,7 @@ def test_leg_reports_upscale_failure_and_still_cleans_up(monkeypatch):
 # ---- aggregation into the sweep -------------------------------------------------------------------
 
 def test_sweep_ok_when_models_pass_and_r2_skips(monkeypatch):
-    monkeypatch.setattr(handler, "_selftest_one", lambda name, scale: {"ok": True, "model": name})
+    monkeypatch.setattr(handler, "_selftest_one", lambda name, scale, *a, **k: {"ok": True, "model": name})
     monkeypatch.setattr(handler, "_selftest_r2", lambda *a, **k: {"ok": None, "skipped": "no creds"})
     res = handler._selftest({"selftest": True})
     assert res["ok"] is True                     # a skipped R2 leg does NOT fail the sweep
@@ -131,7 +131,7 @@ def test_sweep_ok_when_models_pass_and_r2_skips(monkeypatch):
 
 
 def test_sweep_fails_when_r2_leg_fails(monkeypatch):
-    monkeypatch.setattr(handler, "_selftest_one", lambda name, scale: {"ok": True})
+    monkeypatch.setattr(handler, "_selftest_one", lambda name, scale, *a, **k: {"ok": True})
     monkeypatch.setattr(handler, "_selftest_r2", lambda *a, **k: {"ok": False, "error": "r2 down"})
     res = handler._selftest({"selftest": True, "r2": True})
     assert res["ok"] is False                    # a FAILED R2 leg fails the sweep
@@ -139,14 +139,24 @@ def test_sweep_fails_when_r2_leg_fails(monkeypatch):
 
 def test_sweep_fails_when_a_model_fails_even_if_r2_ok(monkeypatch):
     monkeypatch.setattr(handler, "_selftest_one",
-                        lambda name, scale: {"ok": name != "RealESRGAN_x4plus"})
+                        lambda name, scale, *a, **k: {"ok": name != "RealESRGAN_x4plus"})
     monkeypatch.setattr(handler, "_selftest_r2", lambda *a, **k: {"ok": True})
     res = handler._selftest({"selftest": True})
     assert res["ok"] is False
 
 
 def test_single_model_with_r2_flag_attaches_leg(monkeypatch):
-    monkeypatch.setattr(handler, "_selftest_one", lambda name, scale: {"ok": True, "model": name})
+    monkeypatch.setattr(handler, "_selftest_one", lambda name, scale, *a, **k: {"ok": True, "model": name})
     monkeypatch.setattr(handler, "_selftest_r2", lambda *a, **k: {"ok": True, "model": "x"})
     res = handler._selftest({"selftest": True, "model": "RealESRGAN_x4plus", "r2": True})
     assert res["ok"] is True and res["r2"]["ok"] is True
+
+
+def test_res_and_dur_thread_to_selftest_one(monkeypatch):
+    seen = []
+    monkeypatch.setattr(handler, "_selftest_one",
+                        lambda name, scale, res="1280x720", dur=3: seen.append((name, scale, res, dur))
+                        or {"ok": True})
+    monkeypatch.setattr(handler, "_selftest_r2", lambda *a, **k: {"ok": None, "skipped": "no creds"})
+    handler._selftest({"selftest": True, "scale": 4, "res": "2560x1440", "dur": 1})
+    assert seen and all(r == "2560x1440" and d == 1 and sc == 4 for _, sc, r, d in seen)

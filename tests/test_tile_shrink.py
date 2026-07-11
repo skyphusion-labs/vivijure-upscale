@@ -111,3 +111,16 @@ def test_cleanup_optional():
     out = h._shrink_on_oom(pf, tile=512, floor=64)
     assert out == "out@256"
     assert pf.calls == [512, 256]
+
+
+def test_parse_res_valid_and_evened():
+    h = _load_handler()
+    assert h._parse_res("2560x1440") == (2560, 1440)
+    assert h._parse_res("1281x721") == (1280, 720)   # forced even
+    assert h._parse_res("640X480") == (640, 480)      # case-insensitive
+
+
+def test_parse_res_bad_input_falls_back_to_720p():
+    h = _load_handler()
+    for bad in ("", "junk", "12x", "x720", "9x9", "99999x1", None):
+        assert h._parse_res(bad) == (1280, 720)
