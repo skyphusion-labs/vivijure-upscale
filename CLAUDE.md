@@ -2,7 +2,7 @@
 
 Guidance for Claude Code (and the crew) working in this repo.
 
-> Default branch is **`master`** (not `main`). Commit and push to `master`.
+> Default branch is **`main`**. Commit via PR (branch-protected, no direct pushes); CI must pass.
 
 ## What this is
 
@@ -15,8 +15,8 @@ and is the natural partner that returns a MuseTalk-synced shot to delivery res.
 
 This repo is the image + the RunPod handler; the studio-side `upscale` module worker (a thin CF Worker
 behind the typed finish hook in `vivijure`) is what calls this endpoint. Image:
-`ghcr.io/skyphusion-labs/vivijure-upscale` (current release tag **v0.2.6**, the immutable tag the
-endpoint pins to).
+`ghcr.io/skyphusion-labs/vivijure-upscale` (the latest `v*` git tag is the immutable tag the
+endpoint pins to; see CHANGELOG.md / the git tags).
 
 ## The Vivijure constellation (the same map is in each repo)
 
@@ -92,8 +92,8 @@ python -m py_compile handler.py
 1080p). See the README "Tunables" table.
 
 **Release / deploy mechanics.** `.github/workflows/build-image.yml` builds + pushes to GHCR on a push to
-`master` (touching the build inputs) as `:latest` + `:<sha>`; a pushed semver tag (`v0.2.6`) ALSO
-publishes the bare `:0.2.6` (the immutable tag the endpoint pins to). PUBLIC repo, so CI runs on
+`main` (touching the build inputs) as `:latest` + `:<sha>`; a pushed semver tag (`vMAJOR.MINOR.PATCH`)
+ALSO publishes the matching bare `:MAJOR.MINOR.PATCH` (the immutable tag the endpoint pins to). PUBLIC repo, so CI runs on
 GitHub-hosted `ubuntu-latest`. The RunPod endpoint's image tag, **GPU type, and R2 env are dashboard /
 endpoint-config knobs** (RunPod's API does not honor them); **container-registry-auth IS now
 MCP/API-manageable** (RunPod MCP `create-container-registry-auth` + attach via `containerRegistryAuthId`
@@ -146,4 +146,4 @@ Treat the image-extracted files as the source of truth they reconstruct.
 
 Conventional Commits (`feat(scope):`, `fix(scope):`, `docs:`); body explains the why. SemVer-style
 `0.MINOR.PATCH` while pre-1.0 (PATCH for fixes / backend tweaks, MINOR for features). A release is a
-pushed `vMAJOR.MINOR.PATCH` git tag on `master` (CI publishes the matching immutable image tag).
+pushed `vMAJOR.MINOR.PATCH` git tag on `main` (CI publishes the matching immutable image tag).
