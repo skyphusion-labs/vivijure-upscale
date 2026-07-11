@@ -311,6 +311,12 @@ def _upscale_video(model, src, dst, final_scale):
             raise TimeoutError("upscale exceeded FFMPEG_TIMEOUT")
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+        # Hand the card to the NVENC encoder with room to work: the upscale phase leaves the torch CUDA
+        # caching allocator holding reserved-but-free VRAM that a SEPARATE CUDA context (ffmpeg h264_nvenc)
+        # cannot use, so on a memory-tight or co-tenanted card the encoder fails to init its input buffers
+        # ("CreateInputBuffer failed: out of memory") and the frame pipe breaks. All outputs are already on
+        # the CPU here, so releasing the cache is free; the model weights (allocated, not cached) survive.
+        torch.cuda.empty_cache()
     del inputs
     t2 = time.monotonic()
 
