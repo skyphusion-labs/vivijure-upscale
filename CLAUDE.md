@@ -16,7 +16,7 @@ and is the natural partner that returns a MuseTalk-synced shot to delivery res.
 This repo is the image + the RunPod handler; the studio-side `upscale` module worker (a thin CF Worker
 behind the typed finish hook in `vivijure`) is what calls this endpoint. Image:
 `ghcr.io/skyphusion-labs/vivijure-upscale` (the latest `v*` git tag is the immutable tag the
-endpoint pins to; see CHANGELOG.md / the git tags).
+endpoint pins to; see the git tags).
 
 ## The Vivijure constellation (the same map is in each repo)
 
