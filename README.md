@@ -107,8 +107,10 @@ Every setting is in `deploy.env`, and each one is explained in full (what it is,
 | `MAX_OUTPUT_LONG_EDGE` | Output size cap in px (default 3840 = 4K UHD). |
 | `FFMPEG_TIMEOUT` | Per-step wall-clock guard in seconds (default 1200). |
 | `UPSCALE_BATCH` | Frames upscaled at once (default 16); lower it on a smaller card. On a CUDA out-of-memory the handler auto-splits the batch (down to 1 frame) and retries, so a heavy model never hard-fails. |
-| `UPSCALE_TILE` | Tile size in px (default 512); trades VRAM for speed. Keep it below the frame size so tiling actually subdivides -- a heavy 4x model (RealESRGAN_x4plus) needs this to fit. |
+| `UPSCALE_TILE` | Tile size in px (default 512); trades VRAM for speed. Keep it below the frame size so tiling actually subdivides -- a heavy 4x model (RealESRGAN_x4plus) needs this to fit. x4plus at 512 wants a large card (>= ~80 GB); use `UPSCALE_TILE=256` on a smaller (~48 GB) card. |
+| `UPSCALE_TILE_FLOOR` | Smallest tile the auto-shrink fallback drops to (default 64 px). If a single frame will not fit even after the batch split reaches 1, the handler halves the tile down to this floor so a small card still finishes instead of hard-failing. |
 | `UPSCALE_FP16` | Half precision on (1) or off (0); default 1, effectively lossless. |
+| `PYTORCH_CUDA_ALLOC_CONF` | CUDA allocator config (default `expandable_segments:True`, set before torch loads); cuts reserved-but-unused VRAM fragmentation so a heavy model fits with real headroom. |
 | `CONTAINER_REGISTRY_AUTH_ID` | RunPod credential id, only if your image is private. |
 | `R2_ENDPOINT_URL` / `R2_BUCKET` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 keys for the studio's finish-chain mode (the endpoint reads/writes your bucket by key). |
 
@@ -125,7 +127,10 @@ Three modes, so you know exactly what the endpoint does.
 - **Self-test:** `{ "selftest": true, "scale": 2 }` upscales a generated clip end to end and reports
   the encoder used, GPU use, and timing, so you can prove a fresh endpoint is GPU-bound. With no `model`
   it SWEEPS every shipped model (so a heavy model like `RealESRGAN_x4plus` is verified on the real GPU,
-  not just the default); pass `"model": "..."` to test one. `ok` is true only when every swept model passed.
+  not just the default) AND runs the R2 finish-contract round-trip (#26); pass `"model": "..."` to test
+  one model. The R2 leg honest-skips when the endpoint has no R2 creds (reported, never a silent pass);
+  pass `"r2": true` to require it. `ok` is true only when every swept model passed and the R2 leg did not
+  fail. (`VERIFY=1` on `./deploy.sh` runs this sweep against the fresh endpoint and fails closed.)
 
 Both work modes also accept an optional **`output_hash`** (a 64-char hex string the studio computes over
 the step's inputs, #583). When present, the handler writes it VERBATIM to `<output_key>.hash` AFTER the
