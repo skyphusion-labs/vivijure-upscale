@@ -16,8 +16,11 @@
 # compiled into ffmpeg below; the on-card encode is proven by the {"selftest": true} verify job.
 #
 # Base: RunPod's torch 2.8.0 / CUDA 12.8.1 image (ubuntu 22.04, conda), matching the recovered image's
-# PyTorch/CUDA stack. torch is provided by the base, so requirements.txt does not pin it.
-FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2204
+# PyTorch/CUDA stack. torch is provided by the base, so requirements.txt does not pin it. The FROM is
+# digest-pinned (not the mutable tag) so a rebuild is deterministic, matching the backend posture.
+# tag: runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2204 (manifest-list digest, pinned #27). Dockerfile
+# syntax has no inline comments, so the tag is recorded here, on a comment line above the FROM.
+FROM runpod/pytorch@sha256:263d4144a3053f5125b04174e279d73b43768c5b798cd76c4871af7b737f0c84
 
 ENV DEBIAN_FRONTEND=noninteractive
 
