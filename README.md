@@ -86,7 +86,7 @@ This engine powers the studio's **finish-upscale** module. Once the endpoint is 
 
 1. Copy the endpoint id the script printed.
 2. In your studio's `deploy.env`, set **`VIDEO_UPSCALE_RUNPOD_ENDPOINT_ID`** to that id.
-3. Keep `VIVIJURE_PROFILE=full` and re-run the studio's `./deploy.sh`.
+3. Set `VIVIJURE_PROFILE=satellites` and re-run the studio's `./deploy.sh`.
 
 See the studio's [docs/opt-in-tiers.md](https://github.com/skyphusion-labs/vivijure/blob/main/docs/opt-in-tiers.md)
 (the "finish-upscale" entry).
