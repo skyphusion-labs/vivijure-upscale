@@ -49,7 +49,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Free disk space (CUDA image needs more than the ~14GB hosted default)
+      - name: Free disk space (hosted runners only; Plane C has TB-class disk)
+        if: runner.environment == 'github-hosted'
         run: |
           set -eu
           echo "--- before ---"; df -h /
@@ -58,7 +59,7 @@ jobs:
           sudo rm -rf /opt/ghc || true
           sudo rm -rf /opt/hostedtoolcache/CodeQL || true
           sudo rm -rf /usr/local/share/boost || true
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-}" || true
           sudo docker image prune -af || true
           echo "--- after ---"; df -h /
 
