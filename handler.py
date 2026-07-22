@@ -12,13 +12,21 @@ The output resolution is clamped (model is 4x native, but a 2x request is rescal
 this image, encode HONESTLY falls back to a bounded libx264 (the resolution cap keeps the CPU encode
 bounded); the chosen encoder is reported in the result so a fallback is never silent.
 
-Job input:
+Job input (R2 finish-chain mode -- shared bucket):
   {
-    "video_url":  "<presigned R2 GET of the source clip>",   # required (presigned mode)
-    "output_url": "<presigned R2 PUT for the result>",       # required (presigned mode)
+    "project":    "<project>",                               # required -- scopes every renders/ key
+    "clip_key":   "renders/<project>/clips/<shot>.mp4",
+    "output_key": "renders/<project>/clips/<shot>_up.mp4",   # optional
+    "scale":      2,
+    "model":      "realesr-animevideov3"
+  }
+Job input (presigned mode):
+  {
+    "video_url":  "<presigned R2 GET of the source clip>",
+    "output_url": "<presigned R2 PUT for the result>",
     "output_key": "renders/<project>/clips/<shot>_up.mp4",   # echoed back
-    "scale":      2,                          # final factor 2|4 (model is 4x; 2 = 4x then GPU downscale /2)
-    "model":      "realesr-animevideov3"      # realesr-animevideov3 (anime/fast) | RealESRGAN_x4plus (general)
+    "scale":      2,
+    "model":      "realesr-animevideov3"
   }
 Returns: { ok, output_key, bytes, scale, model, frames, encoder } on success; { ok: false, error }
 otherwise. The upscale module treats a non-ok result as a soft-degrade (passthrough the original) --
@@ -547,6 +555,29 @@ def _key_error(key, what, prefixes=("renders/",)):
     return None if ok else f"{what}: R2 key {k!r} must be a plain relative key under {' or '.join(prefixes)}"
 
 
+def _project_prefix(project):
+    """Trusted project segment for shared-bucket tenancy. Mirrors studio finish keys
+    (`renders/${project}/...`) -- reject slash/backslash/whitespace so the field cannot widen the prefix."""
+    raw = str(project or "")
+    p = raw.strip()
+    if not p or p != raw or "/" in p or "\\" in p or any(c.isspace() for c in p):
+        return None
+    return f"renders/{p}/"
+
+
+def _scoped_key_error(key, what, *, project, prefixes=("renders/",)):
+    """Prefix-check plus project tenancy for renders/ keys."""
+    err = _key_error(key, what, prefixes=prefixes)
+    if err:
+        return err
+    pref = _project_prefix(project)
+    if not pref:
+        return f"{what}: project is required for R2 mode"
+    if not str(key).startswith(pref):
+        return f"{what}: R2 key must be under {pref}"
+    return None
+
+
 def _stamp_sidecar_r2(s3, output_key, output_hash):
     """#583 provenance: write the core-computed param-hash to `<output_key>.hash` AFTER the artifact
     (artifact first, sidecar last -- the only safe order; studio CONTRACT.md 3.3.1). Opaque: write the
@@ -579,13 +610,14 @@ def _upscale_r2(inp):
     """R2 mode: download clip_key, upscale, upload output_key in the shared bucket; return the new key as
     `clip_key` so the finish chain passes the upscaled clip downstream."""
     clip_key = inp.get("clip_key")
-    err = _key_error(clip_key, "clip_key")
+    project = inp.get("project")
+    err = _scoped_key_error(clip_key, "clip_key", project=project)
     if err:
         return {"ok": False, "error": err}
     name = clip_key.rsplit("/", 1)[-1]
     output_key = inp.get("output_key") or (
         f"{clip_key.rsplit('.', 1)[0]}_up.{clip_key.rsplit('.', 1)[1]}" if "." in name else f"{clip_key}_up")
-    err = _key_error(output_key, "output_key")
+    err = _scoped_key_error(output_key, "output_key", project=project)
     if err:
         return {"ok": False, "error": err}
     final_scale = 4 if int(inp.get("scale", 2) or 2) >= 4 else 2
@@ -643,7 +675,7 @@ def _selftest_r2(final_scale, model_name, requested):
             leg["error"] = f"ffmpeg gen failed: {(gen.stderr or '')[-300:]}"
             return leg
         s3.upload_file(src, R2_BUCKET, clip_key, ExtraArgs={"ContentType": "video/mp4"})
-        res = _upscale_r2({"clip_key": clip_key, "output_key": output_key,
+        res = _upscale_r2({"project": "_selftest", "clip_key": clip_key, "output_key": output_key,
                            "scale": final_scale, "model": model_name})
         if not res.get("ok"):
             leg["error"] = res.get("error", "_upscale_r2 returned not-ok")
