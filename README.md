@@ -1,5 +1,7 @@
 # vivijure-upscale
 
+[![Runpod](https://api.runpod.io/badge/skyphusion-labs/vivijure-upscale)](https://console.runpod.io/hub/skyphusion-labs/vivijure-upscale)
+
 **Makes your finished video sharper and higher-resolution.** This is the video upscale finish engine
 for [Vivijure](https://github.com/skyphusion-labs/vivijure), the AI film studio. It runs on a GPU
 (RunPod), takes a clip, and hands back a 2x or 4x version. Under the hood it is **Real-ESRGAN** run on

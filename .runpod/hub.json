@@ -1,0 +1,23 @@
+{
+  "title": "Vivijure Upscale",
+  "description": "Video upscale finish engine for Vivijure. Upscales a clip 2x or 4x with Real-ESRGAN on CUDA (spandrel), NVENC encode when available. Weights are baked into the image. Requires a Cloudflare R2 bucket shared with your Studio for finish-chain mode.",
+  "type": "serverless",
+  "category": "video",
+  "iconUrl": "https://vivijure.skyphusion.org/favicon.svg",
+  "config": {
+    "runsOn": "GPU",
+    "gpuCount": 1,
+    "gpuIds": "ADA_24,ADA_48,BLACKWELL_180,-NVIDIA GeForce RTX 4090",
+    "containerDiskInGb": 20,
+    "allowedCudaVersions": ["12.8", "12.6", "12.4", "12.1"],
+    "presets": [
+      { "name": "Standard (shared Studio bucket)", "defaults": { "R2_BUCKET": "vivijure" } }
+    ],
+    "env": [
+      { "key": "R2_ENDPOINT_URL", "input": { "name": "R2 S3 endpoint", "type": "string", "description": "Your Cloudflare R2 S3 endpoint, e.g. https://<account-id>.r2.cloudflarestorage.com (note: this satellite uses R2_ENDPOINT_URL, not R2_ENDPOINT)", "default": "" } },
+      { "key": "R2_ACCESS_KEY_ID", "input": { "name": "R2 access key ID", "type": "string", "description": "The public half of your R2 storage key.", "default": "" } },
+      { "key": "R2_SECRET_ACCESS_KEY", "input": { "name": "R2 secret access key", "type": "string", "description": "The secret half of your R2 storage key. Keep it private.", "default": "" } },
+      { "key": "R2_BUCKET", "input": { "name": "R2 bucket", "type": "string", "description": "The R2 bucket shared with your Vivijure Studio.", "default": "vivijure" } }
+    ]
+  }
+}
