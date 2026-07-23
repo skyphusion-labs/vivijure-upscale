@@ -15,3 +15,4 @@ Documented dismissals for adversarial-audit (K2.7/K3) findings that are not acti
 | Date | Audit | Finding | Rationale |
 | --- | --- | --- | --- |
 | 2026-07-23 | K3 verify ~18:04 | Presigned video_url SSRF | Operator homelab mode; prod uses R2 mode |
+| 2026-07-23 | K3 verify ~18:04 | Unbounded in-memory decode memory DoS | GPU worker bounded by clip duration cap + operator job limits |
