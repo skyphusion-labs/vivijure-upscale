@@ -248,8 +248,11 @@ def run_serve(
             return h[7:] if h.lower().startswith("bearer ") else None
 
         def _body(self) -> dict | None:
-            length = int(self.headers.get("content-length") or 0)
-            if length > MAX_HTTP_BODY_BYTES:
+            try:
+                length = int(self.headers.get("content-length") or 0)
+            except (TypeError, ValueError):
+                return None
+            if length < 0 or length > MAX_HTTP_BODY_BYTES:
                 return None
             if not length:
                 return None
