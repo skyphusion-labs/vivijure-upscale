@@ -58,7 +58,11 @@ def _run_ok(model, src, dst, final_scale):
     return {"frames": 10, "encoder": "libx264"}
 
 
-R2_JOB = {"clip_key": "renders/p/clips/s.mp4", "output_key": "renders/p/clips/s_up.mp4"}
+R2_JOB = {
+    "project": "p",
+    "clip_key": "renders/p/clips/s.mp4",
+    "output_key": "renders/p/clips/s_up.mp4",
+}
 
 
 def _wire(monkeypatch, s3):

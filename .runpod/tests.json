@@ -1,0 +1,11 @@
+{
+  "tests": [
+    { "name": "selftest", "input": { "selftest": true }, "timeout": 300000 }
+  ],
+  "config": {
+    "gpuTypeId": "NVIDIA L4",
+    "gpuCount": 1,
+    "env": [],
+    "allowedCudaVersions": ["12.8", "12.6", "12.4", "12.1"]
+  }
+}
