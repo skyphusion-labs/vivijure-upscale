@@ -1,0 +1,7 @@
+# Serve overlay for homelab LOCAL_FINISH_UPSCALE_URL (RunPod-compatible /run + /status).
+ARG UPSCALE_IMAGE=ghcr.io/skyphusion-labs/vivijure-upscale:1.0.3
+FROM ${UPSCALE_IMAGE}
+
+COPY handler.py runpod_http_serve.py serve.py /app/
+WORKDIR /app
+CMD ["python", "serve.py"]
