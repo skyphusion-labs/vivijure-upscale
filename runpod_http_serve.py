@@ -162,6 +162,9 @@ def token_error(headers_token: str | None, expected: str) -> tuple[int, dict] | 
     return None
 
 
+MAX_HTTP_BODY_BYTES = 1_048_576  # 1 MiB cap on POST /run (K3: memory DoS)
+
+
 def route(
     method: str,
     path: str,
@@ -177,12 +180,12 @@ def route(
         return 200, {"ok": True, "service": service, "version": version, "mode": "local-finish-http"}
 
     if method == "POST" and path == "/run":
-        payload = (body or {}).get("input", body or {})
-        if (body or {}).get("selftest") or payload.get("selftest"):
-            return 200, {"ok": True, "selftest": True, "service": service}
         err = token_error(token, expected_token)
         if err:
             return err
+        payload = (body or {}).get("input", body or {})
+        if (body or {}).get("selftest") or payload.get("selftest"):
+            return 200, {"ok": True, "selftest": True, "service": service}
         job_id = registry.submit(payload)
         return 200, {"id": job_id}
 
@@ -246,6 +249,8 @@ def run_serve(
 
         def _body(self) -> dict | None:
             length = int(self.headers.get("content-length") or 0)
+            if length > MAX_HTTP_BODY_BYTES:
+                return None
             if not length:
                 return None
             try:
