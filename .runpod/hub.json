@@ -7,8 +7,8 @@
   "config": {
     "runsOn": "GPU",
     "gpuCount": 1,
-    "gpuIds": "ADA_24,ADA_48,BLACKWELL_180,-NVIDIA GeForce RTX 4090",
-    "containerDiskInGb": 20,
+    "gpuIds": "ADA_24,ADA_48,BLACKWELL_96,BLACKWELL_180,-NVIDIA GeForce RTX 4090",
+    "containerDiskInGb": 40,
     "allowedCudaVersions": ["12.8", "12.6", "12.4", "12.1"],
     "presets": [
       { "name": "Standard (shared Studio bucket)", "defaults": { "R2_BUCKET": "vivijure" } }
