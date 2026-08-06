@@ -103,9 +103,35 @@ GPU-agnostic. GPU type is set on the endpoint, not in this repo.
 ## Verifying changes
 
 After any handler or Dockerfile change: build clean (the NVENC assert is a build-time fail-fast), then
-**SecurePod** `{"selftest": true}` on a real GPU and confirm `ok:true`, `nvenc_used:true`, and a
-GPU-bound `gpu_sample` before cutting a release tag / repinning prod. Verify the **artifact**, not
-only the pipeline. fp16 is effectively lossless here (PSNR ~66 dB vs fp32).
+run the **pre-prod GPU gate** below and confirm `ok:true`, `nvenc_used:true`, and a GPU-bound
+`gpu_sample` before cutting a release tag / repinning prod. Verify the **artifact**, not only the
+pipeline. fp16 is effectively lossless here (PSNR ~66 dB vs fp32).
+
+## Pre-prod GPU test spend (Conrad, 2026-08-06) -- do not thrift here
+
+**Never hold back RunPod spend when proving an image before it is production-pinned.** A green bake is
+not a proven upscale. Pre-prod verification is **expected spend**, not an escalation. Community pods
+are not the gate. (This is the **video upscale** satellite image repo `vivijure-upscale`.)
+
+Pick **one** of these for the gate (either is fine; pick what fits the change):
+
+| Path | How | When |
+| --- | --- | --- |
+| **SecurePod** | Spin a SecurePod (or equivalent dedicated pod) on the candidate image; run `{"selftest": true}` (and a real short job if needed); verify the **artifact** (`ok:true`, `nvenc_used:true`, GPU-bound `gpu_sample`). | Prefer for isolated image proof without touching prod traffic. |
+| **Serverless endpoint** | Deploy/pin the candidate image on the upscale serverless endpoint, set **active workers (min idle / `workersMin`) to 1** so cold-start does not fake a hang or a false timeout, run the same selftest / short job, verify the artifact. | Prefer when the proof needs the real endpoint shape (env, network, R2). |
+
+### HARD: restore workers after serverless test
+
+If you raised the serverless endpoint's active / min workers **above 0** for testing, **bring it
+back to 0 when the test is done** (same session, before you walk away). Leaving `workersMin` /
+active workers at 1+ burns idle GPU money with no proof benefit. Max workers can stay at the
+prod pin; the restore rule is about the **floor that keeps a warm worker** (min/active = 0 in
+steady state unless Conrad ruled otherwise for prod capacity).
+
+Do **not** skip the restore because "we might test again tomorrow." Re-raise to 1 at the next
+test if needed. Document the before/after values in the PR or runlog when you change them.
+
+Never trust: CI green alone or bake green alone.
 
 ## Source provenance
 
@@ -131,6 +157,8 @@ Treat the image-extracted files as the source of truth they reconstruct.
 - The FIRST command in any op is the member's own login shell: `sudo -u <member> bash -lc '<ops>'`
   (loads their `$HOME`, their `~/dev/vivijure-upscale` clone, their gh / RunPod / R2 creds). Commits and
   PRs land under the member's `skyphusion-<member>` identity, never Conrad's.
+- **Pre-prod GPU proof spend is authorized** (SecurePod or serverless workersMin=1). Do not thrift
+  out of the proof. **Serverless min/active workers back to 0 when the test ends.**
 - Operating memory for the vivijure family lives in the per-project memory under
   `~/.claude/projects/-home-conrad-dev-vivijure/memory/` (`seg-vivijure-modules`); load it before acting.
 - **HARD AUP line:** the CSAM bright line is absolute. Non-negotiable.
