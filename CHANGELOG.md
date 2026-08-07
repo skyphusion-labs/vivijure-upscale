@@ -6,7 +6,7 @@ and a tag publishing an image is **not** the same act as production being pinned
 manual and spend-gated, and several tags below deliberately ship an image nothing repins to. This
 file records the why behind each release. Newest first.
 
-## Unreleased
+## v1.1.0 -- 2026-08-07
 
 - **ci(serve): publish the `*-serve` overlay to GHCR on every release tag (#89 item 1, fc#1592).**
   Nothing built a serve image and nothing would have, so both live video doors ran HAND-BUILT local
