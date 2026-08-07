@@ -184,8 +184,15 @@ def route(
         if err:
             return err
         payload = (body or {}).get("input", body or {})
-        if (body or {}).get("selftest") or payload.get("selftest"):
-            return 200, {"ok": True, "selftest": True, "service": service}
+        # #88 / fc#1592: selftest is FORWARDED to the wrapped handler like any other job, never
+        # intercepted here. `handler._selftest` is the documented deploy-verification GPU check --
+        # it loads every shipped model, generates a real multi-second clip and upscales it on the
+        # card. Answering at this layer without reaching the handler made that check STRUCTURALLY
+        # INCAPABLE OF FAILING: it returned ok:true on a box with no GPU, a broken model, a missing
+        # weight or a dead ffmpeg, which is the one thing a deploy check must never do. Ported from
+        # vivijure-audio-upscale, where the identical intercept was found and fixed first.
+        # /health remains the fast auth-free liveness probe -- unchanged, and deliberately NOT the
+        # thing that proves the card works.
         job_id = registry.submit(payload)
         return 200, {"id": job_id}
 

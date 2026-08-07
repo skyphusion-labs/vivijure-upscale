@@ -152,6 +152,28 @@ def test_single_model_with_r2_flag_attaches_leg(monkeypatch):
     assert res["ok"] is True and res["r2"]["ok"] is True
 
 
+def test_single_model_without_r2_flag_never_touches_the_bucket(monkeypatch):
+    """An explicit `model` and NO `r2` flag must not reach the R2 leg at all.
+
+    This is the path a homelab LOCAL_FINISH door's deploy check takes, and the claim it rests on
+    is not "the leg skipped" but "the leg was never called" -- a skip still constructs a client.
+    Asserting on a call RECORDER rather than on the returned dict, because `res` carrying no "r2"
+    key is also what you would see if the leg ran and returned nothing.
+    """
+    called = []
+    monkeypatch.setattr(handler, "_selftest_one", lambda name, scale, *a, **k: {"ok": True, "model": name})
+    monkeypatch.setattr(handler, "_selftest_r2", lambda *a, **k: called.append("r2") or {"ok": True})
+    res = handler._selftest({"selftest": True, "model": "realesr-animevideov3"})
+    assert called == [], "the R2 leg was invoked on a path that must produce no bucket traffic"
+    assert "r2" not in res
+    assert res["ok"] is True
+
+    # POSITIVE CONTROL: the same recorder MUST fire when the flag is passed, or the empty list
+    # above proves nothing about the code and only that the recorder is broken.
+    handler._selftest({"selftest": True, "model": "realesr-animevideov3", "r2": True})
+    assert called == ["r2"]
+
+
 def test_res_and_dur_thread_to_selftest_one(monkeypatch):
     seen = []
     monkeypatch.setattr(handler, "_selftest_one",

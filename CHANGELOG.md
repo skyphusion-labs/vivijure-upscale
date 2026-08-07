@@ -8,7 +8,40 @@ file records the why behind each release. Newest first.
 
 ## Unreleased
 
-- Nothing yet.
+- **fix(serve): forward `selftest` to the wrapped handler instead of intercepting it (#88,
+  fc#1592).** `runpod_http_serve.route` answered `POST /run {"selftest": true}` with a canned
+  `{"ok": true, "selftest": true, "service": ...}` before the request ever reached
+  `handler._selftest`. That handler is the documented deploy-verification GPU check -- it loads
+  every shipped model, generates a real multi-second clip and upscales it on the card -- so the
+  interception made **the deploy check structurally incapable of failing**: it returned `ok: true`
+  on a box with no GPU, a broken model, a missing weight or a dead ffmpeg. Ported from
+  `vivijure-audio-upscale`, where the identical intercept was found and fixed first (`45a9369`);
+  after this change the two repos' `runpod_http_serve.py` are **code-identical**, proved by
+  token-stream comparison rather than asserted (1826 tokens each, with a negative control showing
+  a mutated stream compares unequal). `/health` is unchanged and remains the auth-free liveness
+  probe -- deliberately not the thing that proves the card works.
+- **test: the serve route had NO coverage at all, in either sibling.** Measured before writing
+  any: `runpod_http_serve` appeared in `Dockerfile.serve` and `serve.py` and in **zero** test
+  files. `tests/test_serve_route.py` now covers forwarding (both the top-level and `input`
+  spellings of `selftest`, since the removed intercept checked both and half of it could return
+  unnoticed), an ordinary job as the discrimination control, `/health` being auth-free AND
+  reaching nothing, 401 on a wrong and on a missing token, 503 when no token is configured at all
+  (a different finding from 401 -- collapsing them would hide a misconfigured door), and 404 for
+  an unknown job id, which is what makes cross-door job-id affinity measurable. It exercises the
+  SHIPPED module with no stubs, because `runpod_http_serve` is stdlib-only by design.
+- **test: cover the explicit-model-without-`r2` selftest path, which nothing did.** The suite had
+  explicit-model WITH `r2: true` and the sweep paths, but not the path a homelab door's deploy
+  check actually takes. It asserts on a call RECORDER rather than on the absence of an `r2` key,
+  because a missing key is also what you would see if the leg ran and returned nothing, and it
+  carries a positive control proving the recorder fires when the flag IS passed.
+- **Both changes were mutation-tested, not merely run.** Reintroducing the intercept turns both
+  forwarding tests red by name and prints the named assertion message; making the R2 leg
+  unconditional turns the new bucket-traffic test red by name; restoring both returns the suite to
+  green. A guard nobody has watched go red is not yet a guard.
+- **No image is published by this.** `build-image.yml` in this repo still builds only `Dockerfile`
+  and there is still no `*-serve` bake (#89 item 1), so the doors currently running on the GPU
+  boxes are hand-built tags and **keep the interception until a serve image is published and they
+  are redeployed from it**. This lands the fix; it does not deploy it.
 
 ## v1.0.5 -- 2026-07-24
 
