@@ -100,6 +100,45 @@ usable NVENC. **No `TORCH_CUDA_ARCH_LIST` to maintain here** (unlike the sibling
 compiles from source, torch kernels come from the `runpod/pytorch` cu1281 base, so the image is
 GPU-agnostic. GPU type is set on the endpoint, not in this repo.
 
+## Homelab serve overlay (the resident LOCAL_FINISH door)
+
+`Dockerfile.serve` + `serve.py` + `runpod_http_serve.py` layer a RunPod-compatible `/run` +
+`/status` HTTP server on the SAME base image the serverless worker ships, so the door runs resident
+on our own GPU boxes instead of paying a serverless cold start per job.
+
+- **Published, not hand-built.** `build-image.yml` publishes `<version>-serve`,
+  `<major>.<minor>-serve` and `sha-<short>-serve` alongside every release tag, from the same job,
+  with the base pinned to the release image that job just built. Evidence about a door has to be
+  evidence about a SHA; a locally-built tag cannot be re-pulled, re-verified or rolled back by
+  anyone else (#89 item 1). Before that bake existed, both live video doors ran hand-built local
+  tags.
+- **`UPSCALE_IMAGE` has no default** and a hand build must pass it. The old literal default drifted
+  two releases behind the current version, and its failure mode is a door that WORKS on a stale
+  base (#89 item 2). Docker refuses an empty `FROM` at parse time, before any pull. The resulting
+  `InvalidDefaultArgInFrom` warning is the intended shape, not a defect to "fix" back.
+- **Port 8012** by default (`PORT`); the speech door (`vivijure-audio-upscale`) is 8013, so both
+  can be resident on one card without a collision. Bind the published port to the VLAN address,
+  never `0.0.0.0`.
+- **`/health` is auth-free liveness only** and never touches the GPU, the model or the handler.
+  The deploy check that CAN fail is `POST /run {"selftest": true}`, which this overlay FORWARDS to
+  the handler (#88 -- it used to intercept it, which made the documented check structurally
+  incapable of failing). Use `/health` as the control that the door is reachable and the selftest
+  as the measurement.
+- **A default selftest also runs an R2 leg.** `_selftest` invokes `_selftest_r2` opportunistically
+  and skips it only when credentials are ABSENT, which on a door they are not. For a GPU check with
+  **zero bucket traffic**, pass an explicit model and no `r2` flag:
+  `{"selftest": true, "model": "realesr-animevideov3"}` -- with a `model` and without `r2`, the R2
+  leg is never called at all. Covered by a test asserting on a call recorder, so it stays true.
+
+**VRAM behaviour, measured on an RTX 4000 SFF Ada (20475 MiB) 2026-08-07.** Unlike the speech door,
+**this one gives its memory back**: `handler.py` calls `torch.cuda.empty_cache()` after upscale so
+the NVENC encoder (a separate CUDA context that cannot use torch's reserved pool) has room to
+initialise. Measured across a real job at 0.5s sampling: **192 MiB resident before, 6392 MiB at
+peak, 192 MiB after.** The peak is transient working memory proportional to frame size and batch,
+so it is a property of the JOB and not of the door -- do not quote it as a resident footprint. On a
+card shared with a resident speech door the concurrent peak was **18797 of 20475 MiB**, which is
+the number to check before co-tenanting anything else on that card.
+
 ## Verifying changes
 
 After any handler or Dockerfile change: build clean (the NVENC assert is a build-time fail-fast), then

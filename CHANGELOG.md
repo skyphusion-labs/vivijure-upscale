@@ -8,6 +8,49 @@ file records the why behind each release. Newest first.
 
 ## Unreleased
 
+- **ci(serve): publish the `*-serve` overlay to GHCR on every release tag (#89 item 1, fc#1592).**
+  Nothing built a serve image and nothing would have, so both live video doors ran HAND-BUILT local
+  tags -- forbidden by our own rule that evidence must be about a SHA, and unrollable by anyone but
+  the operator who built them. `build-image.yml` now builds and pushes `<version>-serve`,
+  `<major>.<minor>-serve` and `sha-<short>-serve` from the SAME job as the release image, gated
+  identically (a bare merge to main smoke-builds and does not publish). Same job because the
+  overlay's `FROM` **is** the release image: the ordering is not optional, the base is already in
+  the local daemon (one thin layer instead of a second tens-of-GB pull), and the published overlay
+  and its base always come from one source tree. Ported from `vivijure-audio-upscale`, where the
+  same gap was closed first.
+  **Not a verbatim port, and the difference was measured before writing it:** that repo pins its
+  CUDA base by TAG and therefore needs plain `docker build` plus host prep, while this one pins by
+  DIGEST (`FROM runpod/pytorch@sha256:263d4144...`), which is exactly why `build-push-action` is
+  correct here and converting it to match the sibling would have been the wrong reflex. The release
+  step keeps buildx and now states `load: true` so the overlay's base being local is a CONTRACT
+  rather than an accident of the default driver; the overlay itself uses plain `docker build`,
+  because it must resolve its base from the LOCAL daemon and buildx would re-resolve the name
+  against the registry -- which on the smoke path does not exist yet and on the tag path could
+  return a different image than the one just built. The serve step carries the same two controls as
+  the sibling (the base must be one of the tags THIS job built, whole-line matched, and it must
+  already exist locally) and prints `derived N serve tags of M release tags` with a floor.
+- **fix(serve): `UPSCALE_IMAGE` no longer carries a default (#89 item 2).** It pinned the literal
+  `:1.0.3` while the current release was `:1.0.5` -- two releases of silent drift, whose failure
+  mode is a door that WORKS on a stale base, the failure nobody investigates. CI now passes the tag
+  it just built; a hand build must pass the arg. Proved with a control pair on real docker: no arg
+  -> `rc=1`, `base name (${UPSCALE_IMAGE}) should not be blank`, refused at parse before any pull;
+  `--build-arg UPSCALE_IMAGE=busybox:latest` -> `rc=0`, so the refusal is the missing arg and not a
+  malformed Dockerfile. The resulting `InvalidDefaultArgInFrom` warning is the intended shape and is
+  documented as such in `CLAUDE.md`.
+- **fix(ci): the release tag name no longer interpolates into a shell script.** The allowlist sync
+  step passed `${{ github.ref_name }}` **inside** a `run:` block, and a GitHub expression is
+  substituted into the shell source before bash parses it, so a tag name carrying shell
+  metacharacters would be executed with a privileged token in the environment. Now passed via `env:`
+  and validated against `^v[0-9]+(\.[0-9]+)*$` before use, matching what
+  `vivijure-audio-upscale` already does. Called out separately in the PR because it is a security
+  fix that happens to live in the file the bake touches, not part of the bake.
+- **docs: `CLAUDE.md` gains a homelab serve-overlay section**, including the measured VRAM behaviour
+  that distinguishes this door from the speech one: this handler calls `torch.cuda.empty_cache()`
+  after upscale, so it returns to **192 MiB between jobs** with a transient **6392 MiB** peak during
+  one, and that peak is a property of the JOB rather than a resident footprint. Also records that a
+  default `{"selftest": true}` runs an R2 leg unless an explicit `model` is passed without `r2`.
+
+
 - **fix(serve): forward `selftest` to the wrapped handler instead of intercepting it (#88,
   fc#1592).** `runpod_http_serve.route` answered `POST /run {"selftest": true}` with a canned
   `{"ok": true, "selftest": true, "service": ...}` before the request ever reached

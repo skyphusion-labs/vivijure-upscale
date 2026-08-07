@@ -1,5 +1,18 @@
 # Serve overlay for homelab LOCAL_FINISH_UPSCALE_URL (RunPod-compatible /run + /status).
-ARG UPSCALE_IMAGE=ghcr.io/skyphusion-labs/vivijure-upscale:1.0.3
+#
+# UPSCALE_IMAGE HAS NO DEFAULT ON PURPOSE (#89 item 2). It used to default to the literal
+# `:1.0.3` while the current release was `:1.0.5` -- a hand copy of something the artifact already
+# knows, so it drifts one release at a time, and its failure mode is a door that WORKS on a stale
+# base, which is the failure nobody investigates because it runs. Docker refuses an empty FROM at
+# parse time, before any pull, so a forgotten arg fails loudly and instantly.
+#
+# build-image.yml passes the release tag it JUST built from this same commit, so the published
+# `<version>-serve` image and its base always come from one source tree. A hand build must pass
+# the arg explicitly:
+#   docker build -f Dockerfile.serve \
+#     --build-arg UPSCALE_IMAGE=ghcr.io/skyphusion-labs/vivijure-upscale:<version> \
+#     -t vivijure-upscale-serve:dev .
+ARG UPSCALE_IMAGE
 FROM ${UPSCALE_IMAGE}
 
 COPY handler.py runpod_http_serve.py serve.py /app/
