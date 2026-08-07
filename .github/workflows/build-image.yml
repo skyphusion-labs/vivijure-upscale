@@ -25,8 +25,11 @@ on:
     branches: [main]
     paths:
       - Dockerfile
+      - Dockerfile.serve
       - handler.py
       - requirements.txt
+      - runpod_http_serve.py
+      - serve.py
       - .github/workflows/build-image.yml
     tags:
       - "v*.*.*"
@@ -69,11 +72,19 @@ jobs:
       - name: Sync vivijure-gpu-builds allowlist
         env:
           GH_TOKEN: ${{ secrets.RUNNER_GROUP_ADMIN_TOKEN }}
+          # Pass via env, NOT `${{ }}` inside the script: an expression is substituted into the
+          # shell source before bash parses it, so a tag name carrying shell metacharacters would
+          # be EXECUTED. Matches vivijure-audio-upscale, which already does both halves of this.
+          ENSURE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          if [[ ! "$ENSURE_TAG" =~ ^v[0-9]+(\.[0-9]+)*$ ]]; then
+            echo "::error::refusing non-SemVer tag name: ${ENSURE_TAG@Q}"
+            exit 1
+          fi
           bash scripts/sync-vivijure-gpu-builds-allowlist.sh \
             --apply \
-            --ensure-tag "vivijure-upscale" "${{ github.ref_name }}"
+            --ensure-tag "vivijure-upscale" "$ENSURE_TAG"
 
   build:
     needs: sync-gpu-allowlist
@@ -120,6 +131,7 @@ jobs:
             type=sha,format=short
 
       - name: Build and push
+        id: release
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -128,3 +140,108 @@ jobs:
           push: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # STATED, not assumed: the serve overlay below builds FROM this image, so it has to be in
+          # the local daemon. The default docker driver loads it anyway; saying so makes it a
+          # contract a future builder change cannot quietly break, and the serve step refuses
+          # loudly if it is ever untrue rather than pulling something same-named from the registry.
+          load: true
+
+      - name: Build serve overlay
+        # Ported from vivijure-audio-upscale#96. Same job as the release image because the
+        # overlay's FROM *is* that image: the ordering is not optional, the base is already local
+        # so the overlay costs one thin layer instead of a second tens-of-GB pull, and the
+        # published `<version>-serve` and its base always come from ONE source tree.
+        #
+        # Plain `docker build` here, deliberately, even though the release image above uses buildx:
+        # this build must resolve its base from the LOCAL daemon, and buildx would re-resolve the
+        # name against the registry -- which on the smoke path does not exist yet, and on the tag
+        # path could silently return a different image than the one this job just built.
+        env:
+          META_TAGS: ${{ steps.meta.outputs.tags }}
+          META_VERSION: ${{ steps.meta.outputs.version }}
+          RELEASE_DIGEST: ${{ steps.release.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [ -z "${META_VERSION:-}" ]; then
+            echo "::error::metadata-action produced no version; cannot resolve a serve base"
+            exit 1
+          fi
+          base="${IMAGE}:${META_VERSION}"
+
+          # CONTROL 1 -- the base must be one of the tags THIS job built, matched WHOLE-LINE.
+          # A substring match would accept a near-miss tag.
+          if ! printf '%s\n' "$META_TAGS" | grep -Fxq "$base"; then
+            echo "::error::resolved serve base ${base} is not among the tags this job built:"
+            printf '%s\n' "$META_TAGS"
+            exit 1
+          fi
+
+          # CONTROL 2 -- and it must already be LOCAL. This failure has no tell of its own: if the
+          # base were absent, docker would silently PULL a same-named tag and the overlay would
+          # build on an image that is NOT the one just built, succeeding with an identical log.
+          # Refusing is correct even though it turns a builder-behaviour change into a red build --
+          # that is the loud failure, and the alternative is a quiet wrong artifact.
+          if ! docker image inspect "$base" >/dev/null 2>&1; then
+            echo "::error::serve base ${base} is not in the local daemon. The release step is"
+            echo "::error::expected to load it (load: true). Refusing to let docker pull a"
+            echo "::error::same-named image from the registry, which may not be this build."
+            exit 1
+          fi
+          echo "serve base ${base} -> image id $(docker image inspect --format '{{.Id}}' "$base")"
+          if [ -n "${RELEASE_DIGEST:-}" ]; then
+            echo "release step reported digest ${RELEASE_DIGEST}"
+          fi
+
+          # Derive the serve tags from the release tags rather than restating them: a hand-kept
+          # list forks from its source and the fork reads as authoritative.
+          : > "$RUNNER_TEMP/serve-tags.txt"
+          m=0
+          while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            m=$((m + 1))
+            echo "${t}-serve" >> "$RUNNER_TEMP/serve-tags.txt"
+          done <<< "$META_TAGS"
+          n="$(wc -l < "$RUNNER_TEMP/serve-tags.txt")"
+          # DENOMINATOR -- printed, and a floor, so a zero is a harness failure and never a pass.
+          echo "derived ${n} serve tags of ${m} release tags:"
+          cat "$RUNNER_TEMP/serve-tags.txt"
+          if [ "$m" -eq 0 ] || [ "$n" -ne "$m" ]; then
+            echo "::error::derived ${n} serve tags from ${m} release tags; expected 1:1 and at least one"
+            exit 1
+          fi
+
+          ARGS=""
+          while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            ARGS="$ARGS -t $t"
+          done < "$RUNNER_TEMP/serve-tags.txt"
+          docker build -f Dockerfile.serve --build-arg "UPSCALE_IMAGE=${base}" $ARGS .
+
+      - name: Push serve overlay
+        # Same gate as the release push: only a version tag or a deliberate workflow_dispatch
+        # publishes. A bare merge to main built the overlay above and stops there.
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          if [ ! -s "$RUNNER_TEMP/serve-tags.txt" ]; then
+            echo "::error::serve tag list is missing or empty; the build step did not produce one"
+            exit 1
+          fi
+          pushed=0
+          while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            docker push "$t"
+            pushed=$((pushed + 1))
+          done < "$RUNNER_TEMP/serve-tags.txt"
+          echo "pushed ${pushed} of $(wc -l < "$RUNNER_TEMP/serve-tags.txt") serve tags"
+          [ "$pushed" -gt 0 ]
+
+      - name: Remove local serve images to free runner disk
+        if: always()
+        run: |
+          set -uo pipefail
+          [ -s "$RUNNER_TEMP/serve-tags.txt" ] || exit 0
+          while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            docker image rm "$t" || true
+          done < "$RUNNER_TEMP/serve-tags.txt"
