@@ -5,11 +5,26 @@ name: build-image
 # Unified image workflow (mirrors the slate image.yml shape): a pushed SemVer tag
 # (v0.2.6) publishes the immutable, pinnable release image tagged with the clean
 # version (0.2.6), the major.minor (0.2), and the short commit sha (sha-abc1234).
-# There is NO :latest -- a RunPod endpoint template pins an explicit :version so a
-# re-provision is deterministic (re-pinning the endpoint is a separate, deliberate,
-# spend-gated step). A push to main that touches the image inputs still BUILDS the
-# image as a smoke but does NOT push it; only a pushed version tag (or a manual
-# workflow_dispatch) publishes to GHCR. A bare merge to main never publishes.
+# A push to main that touches the image inputs still BUILDS the image as a smoke
+# but does NOT push it; only a pushed version tag (or a manual workflow_dispatch)
+# publishes to GHCR. A bare merge to main never publishes.
+#
+# :latest EXISTS and TRACKS THE NEWEST RELEASE. NOTHING MAY EVER PIN IT. RunPod
+# endpoints, compose files and the connectivity-directory pin system
+# (vivijure-control-plane/src/satellite-pins.ts) all pin an explicit version,
+# never `latest` -- that is the real invariant this workflow can hold, not that
+# the tag must not exist. This header previously read "There is NO :latest",
+# which was false: docker/metadata-action defaults to `flavor: latest=auto`,
+# which mints the tag on every SemVer tag push regardless of the `tags:` list
+# below (currently `:latest` -> 1.1.0, this repo's newest release).
+#
+# `latest=auto` is KEPT DELIBERATELY. GHCR deletes by VERSION (digest), and
+# :latest shares its digest with the release tag that minted it, so it cannot be
+# removed without deleting that release. Setting `latest=false` now would FREEZE
+# :latest at whatever version currently holds it, forever, while every later
+# release ships past it -- a stale :latest is strictly more dangerous than a
+# current one, since it is the tag most likely to be pulled by accident and
+# would silently serve an old image. See skyphusion-labs/fleet-chezmoi#1630.
 #
 # Runner: GitHub-hosted ubuntu-latest. This repo is PUBLIC, so per the standing runner
 # policy (public repos -> GitHub-hosted, fork-safe; private/internal -> the org fleet
