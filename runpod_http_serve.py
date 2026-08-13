@@ -11,6 +11,7 @@ import os
 import re
 import signal
 import threading
+import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -30,6 +31,13 @@ class Cancelled(Exception):
     pass
 
 
+def _log(msg: str) -> None:
+    """One-line stdout log. flush=True is mandatory: stdout is block-buffered when it is not a TTY,
+    which is always the container case, so an unflushed line can sit in the buffer for the whole
+    job and the log is useless exactly when it is needed."""
+    print(f"door {msg}", flush=True)
+
+
 @dataclass
 class Job:
     id: str
@@ -38,6 +46,10 @@ class Job:
     output: dict | None = None
     error: str | None = None
     _cancel: bool = field(default=False, repr=False)
+    # Observability only (cf#507). queued_at is set at construction, started_at when the worker
+    # picks the job up, so elapsed can distinguish "sat in the queue" from "ran a long time".
+    queued_at: float = field(default_factory=time.monotonic, repr=False)
+    started_at: float | None = field(default=None, repr=False)
 
     def status_dict(self) -> dict:
         d: dict = {"id": self.id, "status": self.status.value}
@@ -60,6 +72,8 @@ class JobRegistry:
         self._completed_order: deque[str] = deque()
         self._max_completed = max_completed
         self._worker: threading.Thread | None = None
+        # Terminal log lines staged under the lock and emitted by _drain_logs with it released.
+        self._pending_logs: list[str] = []
         self._wake = threading.Condition(self._lock)
         self._stop = False
 
@@ -68,8 +82,17 @@ class JobRegistry:
         with self._lock:
             self._jobs[job.id] = job
             self._queue.append(job.id)
+            depth = len(self._queue)
             self._ensure_worker_locked()
             self._wake.notify()
+        # ACCEPT line. Logged here and not only at the terminal transition on purpose: a terminal
+        # line alone cannot distinguish "the door never received this request" from "it received it
+        # and died before reaching a terminal state", and those two states reading the same is
+        # exactly what made a silent door indistinguishable from an unreachable one (cf#507).
+        # The accept line is what makes a MISSING terminal line mean something.
+        # depth is the queue length AFTER this job: the door drains strictly FIFO on one worker
+        # thread, so depth > 1 is the door being saturated rather than slow.
+        _log(f"accept job={job.id} depth={depth}")
         return job.id
 
     def get(self, job_id: str) -> Job | None:
@@ -77,22 +100,36 @@ class JobRegistry:
             return self._jobs.get(job_id)
 
     def cancel(self, job_id: str) -> bool:
+        # Single exit so the staged line is emitted with the lock released. Every path below
+        # returned True before this change and every path still does; only the exit moved.
         with self._lock:
             job = self._jobs.get(job_id)
-            if job is None:
-                return True
-            if job.status is JobStatus.IN_QUEUE:
-                try:
-                    self._queue.remove(job_id)
-                except ValueError:
-                    pass
-                job.status = JobStatus.FAILED
-                job.error = "canceled before start"
-                self._retain_locked(job_id)
-                return True
-            if job.status is JobStatus.IN_PROGRESS:
-                job._cancel = True
-            return True
+            if job is not None:
+                if job.status is JobStatus.IN_QUEUE:
+                    try:
+                        self._queue.remove(job_id)
+                    except ValueError:
+                        pass
+                    job.status = JobStatus.FAILED
+                    job.error = "canceled before start"
+                    self._retain_locked(job_id)
+                elif job.status is JobStatus.IN_PROGRESS:
+                    job._cancel = True
+        self._drain_logs()
+        return True
+
+    def _drain_logs(self) -> None:
+        """Emit staged lines with the lock RELEASED. Swap-under-lock, print outside.
+
+        Idempotent and safe to call anywhere: an empty buffer is a no-op. That matters because it
+        makes a MISSED drain call delay a line rather than lose it -- the next drain flushes it --
+        which is the failure direction to prefer for an observability path.
+        """
+        with self._lock:
+            staged = self._pending_logs
+            self._pending_logs = []
+        for line in staged:
+            _log(line)
 
     def _ensure_worker_locked(self) -> None:
         if self._worker is None or not self._worker.is_alive():
@@ -101,6 +138,11 @@ class JobRegistry:
 
     def _run_loop(self) -> None:
         while True:
+            # Single drain point for every terminal transition this loop produces. Each of them
+            # either `continue`s or falls out of the try/except, and both routes come back here,
+            # so one call covers all four BY CONSTRUCTION rather than by four remembered calls.
+            # Placed before the lock is taken, so nothing is ever printed while holding it.
+            self._drain_logs()
             with self._lock:
                 while not self._queue and not self._stop:
                     self._wake.wait()
@@ -116,6 +158,7 @@ class JobRegistry:
                     self._retain_locked(job_id)
                     continue
                 job.status = JobStatus.IN_PROGRESS
+                job.started_at = time.monotonic()
             try:
                 output = self._run_fn(job.payload, lambda: self._is_cancelled(job_id))
                 with self._lock:
@@ -139,6 +182,25 @@ class JobRegistry:
             return bool(job and job._cancel)
 
     def _retain_locked(self, job_id: str) -> None:
+        # TERMINAL line. Deliberately here rather than at each of the five call sites: every
+        # terminal transition (completed, failed, canceled-before-start, canceled, exception)
+        # already funnels through this method, so one line covers all of them BY CONSTRUCTION and
+        # a branch added later cannot silently skip it. Five hand-placed prints could, and the
+        # branch nobody remembers is the one that goes unobserved.
+        # Never logs the payload or any part of it: input carries R2 URLs and a bearer.
+        job = self._jobs.get(job_id)
+        if job is not None:
+            started = job.started_at
+            elapsed = time.monotonic() - (started if started is not None else job.queued_at)
+            ran = "yes" if started is not None else "no"
+            # STAGED, never printed here. This method is lock-held by contract (its name says so),
+            # and print(flush=True) to a container stdout is a BLOCKING write: if the log pipe
+            # fills and nothing drains it, printing here would block while holding self._lock, and
+            # submit/get/cancel all take that same lock. The door would accept nothing and answer
+            # nothing, with no line to say why -- a fix for silence must not add a way to go silent.
+            self._pending_logs.append(
+                f"done job={job_id} status={job.status.value} ran={ran} elapsed={elapsed:.1f}s"
+            )
         self._completed_order.append(job_id)
         while len(self._completed_order) > self._max_completed:
             old = self._completed_order.popleft()
