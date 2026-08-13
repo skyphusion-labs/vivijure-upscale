@@ -72,6 +72,8 @@ class JobRegistry:
         self._completed_order: deque[str] = deque()
         self._max_completed = max_completed
         self._worker: threading.Thread | None = None
+        # Terminal log lines staged under the lock and emitted by _drain_logs with it released.
+        self._pending_logs: list[str] = []
         self._wake = threading.Condition(self._lock)
         self._stop = False
 
@@ -98,22 +100,36 @@ class JobRegistry:
             return self._jobs.get(job_id)
 
     def cancel(self, job_id: str) -> bool:
+        # Single exit so the staged line is emitted with the lock released. Every path below
+        # returned True before this change and every path still does; only the exit moved.
         with self._lock:
             job = self._jobs.get(job_id)
-            if job is None:
-                return True
-            if job.status is JobStatus.IN_QUEUE:
-                try:
-                    self._queue.remove(job_id)
-                except ValueError:
-                    pass
-                job.status = JobStatus.FAILED
-                job.error = "canceled before start"
-                self._retain_locked(job_id)
-                return True
-            if job.status is JobStatus.IN_PROGRESS:
-                job._cancel = True
-            return True
+            if job is not None:
+                if job.status is JobStatus.IN_QUEUE:
+                    try:
+                        self._queue.remove(job_id)
+                    except ValueError:
+                        pass
+                    job.status = JobStatus.FAILED
+                    job.error = "canceled before start"
+                    self._retain_locked(job_id)
+                elif job.status is JobStatus.IN_PROGRESS:
+                    job._cancel = True
+        self._drain_logs()
+        return True
+
+    def _drain_logs(self) -> None:
+        """Emit staged lines with the lock RELEASED. Swap-under-lock, print outside.
+
+        Idempotent and safe to call anywhere: an empty buffer is a no-op. That matters because it
+        makes a MISSED drain call delay a line rather than lose it -- the next drain flushes it --
+        which is the failure direction to prefer for an observability path.
+        """
+        with self._lock:
+            staged = self._pending_logs
+            self._pending_logs = []
+        for line in staged:
+            _log(line)
 
     def _ensure_worker_locked(self) -> None:
         if self._worker is None or not self._worker.is_alive():
@@ -122,6 +138,11 @@ class JobRegistry:
 
     def _run_loop(self) -> None:
         while True:
+            # Single drain point for every terminal transition this loop produces. Each of them
+            # either `continue`s or falls out of the try/except, and both routes come back here,
+            # so one call covers all four BY CONSTRUCTION rather than by four remembered calls.
+            # Placed before the lock is taken, so nothing is ever printed while holding it.
+            self._drain_logs()
             with self._lock:
                 while not self._queue and not self._stop:
                     self._wake.wait()
@@ -172,7 +193,14 @@ class JobRegistry:
             started = job.started_at
             elapsed = time.monotonic() - (started if started is not None else job.queued_at)
             ran = "yes" if started is not None else "no"
-            _log(f"done job={job_id} status={job.status.value} ran={ran} elapsed={elapsed:.1f}s")
+            # STAGED, never printed here. This method is lock-held by contract (its name says so),
+            # and print(flush=True) to a container stdout is a BLOCKING write: if the log pipe
+            # fills and nothing drains it, printing here would block while holding self._lock, and
+            # submit/get/cancel all take that same lock. The door would accept nothing and answer
+            # nothing, with no line to say why -- a fix for silence must not add a way to go silent.
+            self._pending_logs.append(
+                f"done job={job_id} status={job.status.value} ran={ran} elapsed={elapsed:.1f}s"
+            )
         self._completed_order.append(job_id)
         while len(self._completed_order) > self._max_completed:
             old = self._completed_order.popleft()

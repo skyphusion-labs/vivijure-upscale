@@ -10,6 +10,7 @@ The negative controls carry equal weight: a log that leaks the payload would be 
 all, because the payload holds presigned R2 URLs and a bearer.
 """
 import contextlib
+import re
 import importlib.util
 import io
 import sys
@@ -100,3 +101,111 @@ def test_control_the_harness_can_see_a_leak():
     with contextlib.redirect_stdout(buf):
         print(SECRET, flush=True)
     assert SECRET in buf.getvalue()
+
+
+def test_no_log_call_appears_under_the_registry_lock(rhs):
+    """No `_log` call may sit inside a lock-held region. Asserted STATICALLY, on the source.
+
+    WHY NOT A RUNTIME TEST. The first version of this test ran a job and, from inside a patched
+    `_log`, tried `reg._lock.acquire(blocking=False)` -- reasoning that a failure to acquire meant
+    the line was being emitted under the lock. **That instrument cannot distinguish "the printing
+    thread holds the lock" from "the worker thread happens to hold it at this instant"**, which is a
+    different claim entirely. It passed in isolation and failed roughly one run in three in the full
+    suite. A check that cannot separate the two states it exists to separate is not a test, and a
+    flaky one is worse than none because it teaches people to re-run until green.
+
+    The property is structural, so it is asserted structurally and cannot race.
+
+    THE HAZARD IT PROTECTS: `print(flush=True)` to a container's stdout is a BLOCKING write. If the
+    log pipe fills and nothing drains it, a print under `self._lock` blocks while holding it -- and
+    submit, get and cancel all take that same lock. The door would accept nothing and answer
+    nothing, with no line to say why. A fix whose purpose is making silence meaningful must not
+    introduce a new way to go silent.
+    """
+    src = Path(rhs.__file__).read_text().splitlines()
+
+    # Track lock depth by indentation: a `with self._lock:` opens a region that ends when
+    # indentation returns to or below the `with`'s own column.
+    lock_col = None
+    in_locked_fn = False
+    fn_col = None
+    offenders = []
+    for i, line in enumerate(src, start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        col = len(line) - len(line.lstrip())
+        if lock_col is not None and col <= lock_col:
+            lock_col = None
+        # A `*_locked` method is lock-held BY CONTRACT -- that is what the suffix means in this
+        # file -- so its whole body counts as a lock region even though it contains no `with`.
+        # MISSING THIS MADE THE FIRST VERSION OF THIS SCAN DECORATIVE: `_retain_locked` held the
+        # real defect, has no `with self._lock:` of its own, and the scan passed against the
+        # buggy source. It was caught only by driving the test red against the pre-fix code.
+        m = re.match(r"def\s+(\w+)\s*\(", stripped)
+        if m:
+            fn_col = col
+            in_locked_fn = m.group(1).endswith("_locked")
+            lock_col = None
+        elif in_locked_fn and fn_col is not None and col <= fn_col:
+            in_locked_fn = False
+        if re.match(r"with\s+self\._lock\s*:", stripped):
+            lock_col = col
+            continue
+        if (lock_col is not None or in_locked_fn) and re.search(r"(?<!\.)\b_log\s*\(", stripped):
+            offenders.append(f"{i}: {stripped}")
+
+    assert not offenders, "log call under the registry lock: " + "; ".join(offenders)
+
+
+def test_control_the_static_scan_can_find_a_planted_violation(rhs, tmp_path):
+    """POSITIVE CONTROL for the scan above.
+
+    Without this, the scan passes identically whether the source is clean or the matcher is broken.
+    A zero from an instrument never shown capable of a non-zero is not evidence.
+    """
+    planted = tmp_path / "planted.py"
+    planted.write_text(
+        "class X:\n"
+        "    def f(self):\n"
+        "        with self._lock:\n"
+        "            _log('this one is a violation')\n"
+    )
+    src = planted.read_text().splitlines()
+    lock_col = None
+    offenders = []
+    for i, line in enumerate(src, start=1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        col = len(line) - len(line.lstrip())
+        if lock_col is not None and col <= lock_col:
+            lock_col = None
+        if re.match(r"with\s+self\._lock\s*:", stripped):
+            lock_col = col
+            continue
+        if lock_col is not None and re.search(r"(?<!\.)\b_log\s*\(", stripped):
+            offenders.append(f"{i}: {stripped}")
+    assert offenders, "the scan cannot see a planted violation, so its clean result means nothing"
+
+
+def test_cancel_before_start_still_emits_its_terminal_line(rhs):
+    """cancel() returns from inside the lock, so its staged line needs an explicit drain.
+
+    This is the path most likely to be silently dropped by the stage-and-drain change, because it
+    is the one that does not go through the worker loop's drain point.
+    """
+    import contextlib
+    import io
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        reg = rhs.JobRegistry(_ok)
+        # Do not let the worker start draining: submit and cancel while it is still queued is
+        # racy by nature, so assert only that IF it was cancelled before start, the line appears.
+        job_id = reg.submit(dict(PAYLOAD))
+        reg.cancel(job_id)
+        time.sleep(0.2)
+    out = buf.getvalue()
+    assert f"door accept job={job_id}" in out
+    assert f"door done job={job_id}" in out, "terminal line missing on the cancel path"
