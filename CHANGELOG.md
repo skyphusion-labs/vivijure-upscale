@@ -6,6 +6,31 @@ and a tag publishing an image is **not** the same act as production being pinned
 manual and spend-gated, and several tags below deliberately ship an image nothing repins to. This
 file records the why behind each release. Newest first.
 
+## v1.1.1 -- 2026-08-14
+
+- **feat(serve): a log line per job accept and per terminal transition (cf#507).** For six days a
+  healthy door and an unreachable door produced identical `docker logs` output: one startup banner.
+  The serve overlay logged nothing per request, so "zero log lines on the door" was never evidence
+  that the door had not been reached -- it was evidence that the container had nothing to say, and a
+  whole investigation was spent reasoning about that absence. Two lines now: an ACCEPT line at
+  `submit()` carrying the job id and the post-enqueue queue depth, and a TERMINAL line carrying id,
+  status, whether the job actually ran, and elapsed. The accept line is deliberate rather than
+  redundant: a terminal line alone cannot separate "the door never received this request" from "it
+  received it and died before reaching a terminal state", and the accept line is what makes a
+  MISSING terminal line mean something. Depth is the saturation signal the single FIFO worker
+  otherwise gives no way to see. No `logging` import, no framework, no levels: the file goes from
+  one `print(` to three. The payload is never logged in whole or in part, because it carries
+  presigned R2 URLs and a bearer.
+- **fix(serve): never emit a log line while holding the registry lock (cf#507).** `_retain_locked()`
+  is lock-held by contract and called `_log` directly. `print(flush=True)` to a container's stdout
+  is a BLOCKING write, so a stalled log consumer would have wedged the whole door -- `submit`, `get`
+  and `cancel` all take that lock -- and it would have presented as a door that accepts nothing and
+  answers nothing, with no line to say why. A change whose purpose is making silence meaningful must
+  not add a new way to go silent. Lines are now staged under the lock and emitted by `_drain_logs()`
+  with it released; the worker drains once per loop iteration, which covers all four of its terminal
+  transitions by construction, and `cancel()` drains explicitly because it returns from inside the
+  lock. The drain is idempotent so a missed call delays a line rather than losing it.
+
 ## v1.1.0 -- 2026-08-07
 
 - **ci(serve): publish the `*-serve` overlay to GHCR on every release tag (#89 item 1, fc#1592).**
