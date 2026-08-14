@@ -196,6 +196,19 @@ def _shrink_on_oom(pass_fn, tile, floor, cleanup=None):
             tile = max(floor, tile // 2)
 
 
+def _clamped_start_tile(start_tile):
+    """The tile a batch should BEGIN its OOM-shrink search at, clamped into [TILE_FLOOR, TILE].
+
+    `None` means no prior knowledge -> start at the configured TILE. Anything else is the tile a
+    previous batch of this same job settled on, and it is clamped so a carried value can never widen
+    the search past the configured ceiling or drop below the floor. Pure, so it is testable without
+    torch -- which it needed to be: the mutation pass showed that deleting the clamp reddened no
+    test at all while it lived inline."""
+    if start_tile is None:
+        return TILE
+    return max(TILE_FLOOR, min(TILE, int(start_tile)))
+
+
 def _tile_pass(model, t, scale, tile, use_half):
     """One full tiled forward of the batch `t` (N,3,h,w) at a given tile size -> (N,3,h*scale,w*scale).
     Each per-tile forward is itself batch-split-on-OOM (_forward_tile); a single-frame OOM at THIS tile
@@ -215,21 +228,30 @@ def _tile_pass(model, t, scale, tile, use_half):
 
 
 @torch.inference_mode()
-def _upscale_batch(model, frames_np, out_w, out_h):
+def _upscale_batch(model, frames_np, out_w, out_h, start_tile=None):
     """Upscale a BATCH of same-size frames on the GPU, tiled to bound memory, then GPU-resize to
     (out_w,out_h). `frames_np` is a list of (h,w,3) uint8 arrays; returns ((N,out_h,out_w,3) uint8 array,
-    tile_used). fp16 via autocast when enabled. Starts at TILE and, on a single-frame CUDA OOM, shrinks the
-    tile (halving down to TILE_FLOOR) so a small card still finishes (#30). No disk, no per-frame round-trip."""
+    tile_used). fp16 via autocast when enabled. Starts at `start_tile` (default TILE) and, on a
+    single-frame CUDA OOM, shrinks the tile (halving down to TILE_FLOOR) so a small card still
+    finishes (#30). No disk, no per-frame round-trip.
+
+    `start_tile` exists because the shrink search was being re-paid on EVERY batch (#98). The tile a
+    batch settles on is a property of this card, this model and this frame size, none of which change
+    between batches of one job -- so beginning the next batch back at TILE means a forward pass that is
+    KNOWN to OOM, its exception, an `empty_cache()`, and a retry, once per batch. Measured on x4plus at
+    720p the tile settles 512 -> 256, so a 30s shot pays that dance 45 times. It is clamped into
+    [TILE_FLOOR, TILE] so a caller cannot widen the search past the configured ceiling."""
     cuda = torch.cuda.is_available()
     scale = getattr(model, "scale", 4)
     arr = np.stack(frames_np).astype(np.float32) / 255.0      # (N,h,w,3)
     t = torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous().to(_device())  # (N,3,h,w)
     use_half = HALF and cuda
-    used = {"tile": TILE}  # the tile the successful pass settled on (records a shrink for the report)
+    tile0 = _clamped_start_tile(start_tile)
+    used = {"tile": tile0}  # the tile the successful pass settled on (records a shrink for the report)
     def _pass(tile):
         used["tile"] = tile
         return _tile_pass(model, t, scale, tile, use_half)
-    out = _shrink_on_oom(_pass, TILE, TILE_FLOOR,
+    out = _shrink_on_oom(_pass, tile0, TILE_FLOOR,
                          cleanup=(torch.cuda.empty_cache if cuda else None))
     if out.shape[-1] != out_w or out.shape[-2] != out_h:
         out = torch.nn.functional.interpolate(
@@ -307,24 +329,38 @@ def _upscale_video(model, src, dst, final_scale):
     # --- upscale (GPU, batched) -- drop each input batch as it is consumed to bound peak RAM ---
     outputs = []
     tile_min = TILE  # smallest tile any batch settled on; < TILE means the shrink fallback fired (#30)
-    for i in range(0, len(inputs), BATCH):
-        chunk = inputs[i:i + BATCH]
-        frames_np = [np.frombuffer(b, dtype=np.uint8).reshape(sh, sw, 3) for b in chunk]
-        outs, tile_used = _upscale_batch(model, frames_np, out_w, out_h)  # (n,out_h,out_w,3) uint8, tile
-        tile_min = min(tile_min, tile_used)
-        outputs.extend(np.ascontiguousarray(f).tobytes() for f in outs)
-        for j in range(i, min(i + BATCH, len(inputs))):
-            inputs[j] = None
-        if time.monotonic() > deadline:
-            raise TimeoutError("upscale exceeded FFMPEG_TIMEOUT")
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-        # Hand the card to the NVENC encoder with room to work: the upscale phase leaves the torch CUDA
-        # caching allocator holding reserved-but-free VRAM that a SEPARATE CUDA context (ffmpeg h264_nvenc)
-        # cannot use, so on a memory-tight or co-tenanted card the encoder fails to init its input buffers
-        # ("CreateInputBuffer failed: out of memory") and the frame pipe breaks. All outputs are already on
-        # the CPU here, so releasing the cache is free; the model weights (allocated, not cached) survive.
-        torch.cuda.empty_cache()
+    next_tile = None  # carry the settled tile into the next batch instead of re-searching from TILE (#98)
+    try:
+        for i in range(0, len(inputs), BATCH):
+            chunk = inputs[i:i + BATCH]
+            frames_np = [np.frombuffer(b, dtype=np.uint8).reshape(sh, sw, 3) for b in chunk]
+            outs, tile_used = _upscale_batch(model, frames_np, out_w, out_h, start_tile=next_tile)
+            tile_min = min(tile_min, tile_used)
+            next_tile = tile_used
+            outputs.extend(np.ascontiguousarray(f).tobytes() for f in outs)
+            for j in range(i, min(i + BATCH, len(inputs))):
+                inputs[j] = None
+            if time.monotonic() > deadline:
+                raise TimeoutError("upscale exceeded FFMPEG_TIMEOUT")
+    finally:
+        # RELEASED ON EVERY EXIT PATH, INCLUDING THE TIMEOUT (#98). This used to sit after the loop, so
+        # the `raise TimeoutError` above jumped straight over it and the allocator kept its reservation
+        # for the LIFE OF THE PROCESS -- measured at ~19.7 GiB of a 20.5 GiB card still held while the
+        # container sat idle with the job long finished, against ~2 GiB after a job that COMPLETED. Both
+        # doors share one card on the GPU twins, so a co-tenant needing its own CUDA context was left
+        # roughly 700 MiB. The leak was not a property of the model or of torch; it was a property of
+        # the abort path, and a `finally` is the whole fix.
+        #
+        # It also does the job it was originally written for: hand the card to the NVENC encoder with
+        # room to work. The upscale phase leaves the torch CUDA caching allocator holding
+        # reserved-but-free VRAM that a SEPARATE CUDA context (ffmpeg h264_nvenc) cannot use, so on a
+        # memory-tight or co-tenanted card the encoder fails to init its input buffers
+        # ("CreateInputBuffer failed: out of memory") and the frame pipe breaks. All outputs are already
+        # on the CPU here, so releasing the cache is free; the model weights (allocated, not cached)
+        # survive.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
     del inputs
     t2 = time.monotonic()
 
