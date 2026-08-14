@@ -6,6 +6,51 @@ and a tag publishing an image is **not** the same act as production being pinned
 manual and spend-gated, and several tags below deliberately ship an image nothing repins to. This
 file records the why behind each release. Newest first.
 
+## v1.1.2 -- 2026-08-14
+
+- **fix(upscale): release the CUDA cache on the ABORT path, not only on success (#98).**
+  `torch.cuda.empty_cache()` sat immediately AFTER the batch loop with no `try/finally`, so the
+  `raise TimeoutError("upscale exceeded FFMPEG_TIMEOUT")` inside the loop jumped straight over it and
+  the torch caching allocator kept its reservation for the LIFE OF THE PROCESS.
+
+  MEASURED on fatmike, two throwaway containers from the same image, argv differing only in
+  `FFMPEG_TIMEOUT`, each idled 120s with the container still running after the job reached a terminal
+  state:
+
+  | FFMPEG_TIMEOUT | terminal state | VRAM at terminal | VRAM after 120s idle | after container stop |
+  |---|---|---|---|---|
+  | 21600 | COMPLETED | 459 MiB | **459 MiB** | 202 MiB |
+  | 30 | FAILED, `upscale exceeded FFMPEG_TIMEOUT` | 19771 MiB | **19771 MiB** | 202 MiB |
+
+  **So the leak is a property of the ABORT path, not of torch and not of the model.** A completed
+  x4plus job releases normally; a timed-out one holds 19771 MiB of a 20475 MiB card indefinitely,
+  leaving roughly 700 MiB for the co-tenant speech door that shares the card on both GPU twins. The
+  two halves of #98 are one defect: the timeout CAUSES the memory problem. A `finally` is the whole
+  fix, and it covers every exit path rather than special-casing `TimeoutError`.
+
+  The decode deadline exits before this block and deliberately does not release: at that point the
+  only CUDA allocation is the model weights, which are allocated rather than cached, so
+  `empty_cache()` would free nothing. That branch is asserted in the tests so the next reader does
+  not have to guess whether it was considered.
+
+- **perf(upscale): carry the settled tile into the next batch instead of re-searching from `TILE`
+  (#98).** `_upscale_batch` began its OOM-shrink search at the module-level `TILE` on every batch,
+  and the tile a batch settled on was captured only for reporting (`tile_min`). On `RealESRGAN_x4plus`
+  at 720p the tile settles 512 -> 256, so every batch re-ran a forward pass already known to OOM,
+  caught the CUDA error, emptied the cache and retried. MEASURED on fatmike: a 3s clip is 72 frames
+  at `BATCH=16`, so five such cycles; a 30s shot would be 45. The settled tile is now threaded
+  forward, clamped into `[TILE_FLOOR, TILE]` so a carried value can never widen the search past the
+  configured ceiling. It only ever narrows, and a later batch may still shrink further.
+
+  The clamp is a named function rather than an inline expression because the mutation pass showed
+  that deleting it reddened no test at all: it was unreachable from any hermetic test while it lived
+  inside `_upscale_batch`, which needs torch and numpy to run.
+
+- **Also recorded from the same run, because no measurement in #98 had one:** the first `phase_s`
+  breakdown of an x4plus job. `{"extract": 0.15, "upscale": 807.87, "encode": 0.96}` on a 3s 720p
+  clip -- **99.9% of the wall clock is the upscale loop**. The unguarded encode phase is therefore
+  not a factor in the ceiling, and decode is noise.
+
 ## v1.1.1 -- 2026-08-14
 
 - **feat(serve): a log line per job accept and per terminal transition (cf#507).** For six days a
