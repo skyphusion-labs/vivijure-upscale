@@ -58,52 +58,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Inline sync (not workflow_call): public repos cannot call reusable workflows in
-  # internal fleet-chezmoi (workflow validation fails with 0 jobs).
-  sync-gpu-allowlist:
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout fleet-chezmoi (sync script)
-        uses: actions/checkout@v7
-        with:
-          repository: skyphusion-labs/fleet-chezmoi
-          # Pinned merge SHA (same doctrine as adversarial-audit.yml); bump deliberately.
-          ref: ce709cb073e4b65c47505cca7f5bbbbb44ad8210
-          token: ${{ secrets.RUNNER_GROUP_ADMIN_TOKEN }}
-
-      - name: Verify fleet-chezmoi pin
-        run: |
-          set -euo pipefail
-          expected="ce709cb073e4b65c47505cca7f5bbbbb44ad8210"
-          actual="$(git rev-parse HEAD)"
-          if [[ "$actual" != "$expected" ]]; then
-            echo "::error::fleet-chezmoi pin mismatch: expected ${expected} got ${actual}"
-            exit 1
-          fi
-          echo "fleet-chezmoi pin OK (${actual:0:7})"
-
-      - name: Sync vivijure-gpu-builds allowlist
-        env:
-          GH_TOKEN: ${{ secrets.RUNNER_GROUP_ADMIN_TOKEN }}
-          # Pass via env, NOT `${{ }}` inside the script: an expression is substituted into the
-          # shell source before bash parses it, so a tag name carrying shell metacharacters would
-          # be EXECUTED. Matches vivijure-audio-upscale, which already does both halves of this.
-          ENSURE_TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$ENSURE_TAG" =~ ^v[0-9]+(\.[0-9]+)*$ ]]; then
-            echo "::error::refusing non-SemVer tag name: ${ENSURE_TAG@Q}"
-            exit 1
-          fi
-          bash scripts/sync-vivijure-gpu-builds-allowlist.sh \
-            --apply \
-            --ensure-tag "vivijure-upscale" "$ENSURE_TAG"
-
   build:
-    needs: sync-gpu-allowlist
-    if: always() && (needs.sync-gpu-allowlist.result == 'success' || needs.sync-gpu-allowlist.result == 'skipped')
+    # fc#1628: this guard lived on the removed sync-gpu-allowlist job, which was the
+    # only thing stopping a non-tag push from baking. It moves here rather than vanishing.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     # Public repo -> GitHub-hosted (fork-safe). Self-hosted GPU runners are for private repos only.
     runs-on: ubuntu-latest
     timeout-minutes: 240
