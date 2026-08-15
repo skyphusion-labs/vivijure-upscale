@@ -43,6 +43,14 @@ EXECUTION_TIMEOUT_MS="${EXECUTION_TIMEOUT_MS:-600000}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 SKIP_ENDPOINT="${SKIP_ENDPOINT:-0}"
 CONTAINER_REGISTRY_AUTH_ID="${CONTAINER_REGISTRY_AUTH_ID:-}"
+# EXPORTED, and that is a fix rather than tidying (#105). The blocks below read these through
+# `os.environ` in a child python3, and a bare shell assignment is not in a child's environment. Only
+# the knobs an operator SET in deploy.env were exported (by the `set -a` around the source above), so
+# every default on the eight lines here was inoperative: leaving CONTAINER_DISK_GB or
+# EXECUTION_TIMEOUT_MS unset made the template/endpoint body raise KeyError, not take the documented
+# default. Found while wiring EXECUTION_TIMEOUT_MS through to the container below.
+export CONTAINER_DISK_GB WORKERS_MIN WORKERS_MAX IDLE_TIMEOUT EXECUTION_TIMEOUT_MS
+export SKIP_BUILD SKIP_ENDPOINT CONTAINER_REGISTRY_AUTH_ID
 
 # a tiny JSON reader/writer so we do not depend on jq being installed (python3 ships on every box)
 pyget() { python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get(sys.argv[1],"") if isinstance(d,dict) else "")' "$1"; }
@@ -120,6 +128,9 @@ for k in ("R2_ENDPOINT_URL","R2_BUCKET","R2_ACCESS_KEY_ID","R2_SECRET_ACCESS_KEY
           "UPSCALE_FP16","PYTORCH_CUDA_ALLOC_CONF"):
     v=os.environ.get(k,"")
     if v: env[k]=v
+# The container has to KNOW the platform ceiling to size its own wall-clock guard under it (#105), and
+# the only way that number cannot drift is to derive it from the same value we set on the endpoint.
+env["UPSCALE_PLATFORM_TIMEOUT"]=str(int(os.environ["EXECUTION_TIMEOUT_MS"])//1000)
 b={"name":os.environ["TPL_NAME"],"imageName":os.environ["IMAGE"],"isServerless":True,
    "containerDiskInGb":int(os.environ["CONTAINER_DISK_GB"]),"category":"NVIDIA","env":env}
 auth=os.environ.get("CONTAINER_REGISTRY_AUTH_ID","")

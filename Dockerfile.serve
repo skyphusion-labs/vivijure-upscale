@@ -17,4 +17,12 @@ FROM ${UPSCALE_IMAGE}
 
 COPY handler.py runpod_http_serve.py serve.py /app/
 WORKDIR /app
+
+# NO PLATFORM EXECUTION CEILING ON THIS DEPLOYMENT (#105). The handler sizes its wall-clock guard to sit
+# UNDER whatever the platform would kill it at, and on RunPod serverless that is 600s. This door is a
+# long-running container on our own iron: nothing kills a job from outside, so the guard keeps the full
+# FFMPEG_TIMEOUT instead of the RunPod-shaped 570s. Declared HERE rather than in the compose file
+# because the overlay image is the artifact that KNOWS which deployment it is.
+ENV UPSCALE_PLATFORM_TIMEOUT=0
+
 CMD ["python", "serve.py"]
