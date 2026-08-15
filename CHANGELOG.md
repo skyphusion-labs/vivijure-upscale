@@ -6,6 +6,67 @@ and a tag publishing an image is **not** the same act as production being pinned
 manual and spend-gated, and several tags below deliberately ship an image nothing repins to. This
 file records the why behind each release. Newest first.
 
+## Unreleased
+
+- **fix(upscale): bring the ENCODE step inside the invocation deadline, and enforce it ON the child
+  processes (#105).** `_upscale_video` stamped one deadline and checked it twice, at decode and at
+  upscale. Between `t2` and `t3` -- a raw `subprocess.Popen`, a write loop, and an unbounded
+  `enc.wait()` -- there was no check and no timeout, so the invocation was not capped by anything. It
+  read as complete because the module carried `_run(cmd, timeout=FFMPEG_TIMEOUT)`, which looked like
+  the convention the encode path had opted out of. **Measured at `d34135d`: that helper had ZERO
+  callers in the entire repo.** The convention it advertised was honoured by none of the module's
+  subprocess sites, not one; the encode path was not an exception to it, there was no rule. It is
+  replaced by `_run_bounded(cmd, timeout, ...)` with no default for `timeout`, and every
+  `subprocess.run` in the file now goes through it.
+
+  Coverage is now **19 of 19 subprocess and network sites bounded** across `handler.py`,
+  `runpod_http_serve.py` and `serve.py` (the last two hold none), against 7 of 19 before. The two
+  `Popen` children are additionally watchdogged: a deadline check between loop iterations cannot
+  interrupt a write to a pipe nothing is draining or a `wait()` on a stalled child, because both block
+  in the kernel where the next check is never reached. Killing the child is what unblocks them, so the
+  guard acts ON the process rather than only observing the clock. `_load_model` is deliberately
+  outside the budget (a local weights read on a warm-cached path, before the deadline is stamped).
+
+- **fix(upscale): size the guard UNDER the platform ceiling instead of at twice it (#105).** A guard
+  above the platform's own execution timeout can never fire: the platform gets there first, and its
+  kill leaves a job-level FAILED envelope with no structured output, which the studio must treat as a
+  crash and which fails the whole film. `deploy.sh` has passed `executionTimeoutMs=600000` (600s) on
+  every endpoint it creates since 2026-07-01, while `FFMPEG_TIMEOUT` defaults to 1200. The budget is
+  now `min(FFMPEG_TIMEOUT, UPSCALE_PLATFORM_TIMEOUT - UPSCALE_PLATFORM_MARGIN)`, which is **570s** with
+  the defaults: under 600 so it fires whichever way an endpoint reporting `timeout: 0` is read, and
+  `3 * 570 = 1710 < 5400` so it does not silently raise `vivijure-core`'s phase stall ceiling
+  (`max(PHASE_HARD_DEADLINE_SECONDS, FINISH_STEP_MAX_ATTEMPTS * longest declared)` FLOORS that
+  ceiling; it does not cap it). `deploy.sh` passes the value to the container so the two cannot drift,
+  and `Dockerfile.serve` pins it to `0` -- the homelab door has no platform kill, so it keeps the full
+  1200 (`3 * 1200 = 3600`, still inside the floor).
+
+- **fix(upscale): the guard's expiry RETURNS a soft degrade and cannot be swallowed (#105).** Expiry
+  returns `{"ok": false, "detail": "<reason>"}` on every job path -- never a raise, which would leave
+  no structured output and fail the film after the GPU spend is already banked, strictly worse than the
+  hang this replaces. `detail` rather than `error` because `degradeReason` reads it first
+  (`vivijure-cf` `modules/_shared/finish-soft-degrade.ts:77`) and a top-level `error` is lifted by
+  RunPod into a FAILED envelope that books a `failed` job row for a job that degraded honestly.
+  Ordinary errors keep `error` on purpose: they ARE failures. The reason carries the guard name, the
+  step and the elapsed seconds inside the first 120 characters, which is all the panel keeps.
+
+  `InvocationExpired` derives from **BaseException**, not Exception. Every job path in this file ends
+  in a broad `except Exception`, and a guard raising an ordinary exception is caught there, re-keyed to
+  the legacy shape, and reported as an ordinary failure: present, tested, and inert on the exact path
+  it exists for. Nothing has to remember to re-raise it. `finally` blocks still run, so the #98
+  abort-path CUDA cache release is unaffected and is still asserted.
+
+  KNOWN LIMIT, not fixable from this repo: the `passthrough:` tag the panel builds is generic for every
+  cause (`vivijure-core#226`), so a wall-clock degrade and a no-face degrade are indistinguishable
+  downstream. The reason text carries the cause; the counted tag does not.
+
+- **fix(deploy): export the optional knobs so their documented defaults actually apply (#105).**
+  `deploy.sh` sets eight defaults (`CONTAINER_DISK_GB`, `WORKERS_MIN/MAX`, `IDLE_TIMEOUT`,
+  `EXECUTION_TIMEOUT_MS`, ...) with bare shell assignments, then reads them through `os.environ` in a
+  child `python3`. A bare assignment is not in a child's environment, so only the knobs an operator had
+  set in `deploy.env` (exported by the `set -a` around the source) ever arrived: every default on those
+  lines was inoperative and left the template/endpoint body raising `KeyError`. Found while wiring
+  `EXECUTION_TIMEOUT_MS` through to the container.
+
 ## v1.1.2 -- 2026-08-14
 
 - **fix(upscale): release the CUDA cache on the ABORT path, not only on success (#98).**

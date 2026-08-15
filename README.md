@@ -107,7 +107,9 @@ Every setting is in `deploy.env`, and each one is explained in full (what it is,
 | `CONTAINER_DISK_GB` | Disk for the container (default 20; the weights are only a few MB). |
 | `WORKERS_MIN` / `WORKERS_MAX` | Scaling bounds; min 0 = scale to zero = pay nothing when idle. |
 | `MAX_OUTPUT_LONG_EDGE` | Output size cap in px (default 3840 = 4K UHD). |
-| `FFMPEG_TIMEOUT` | Per-step wall-clock guard in seconds (default 1200). |
+| `FFMPEG_TIMEOUT` | Whole-upscale wall-clock guard in seconds (default 1200): probe, decode, upscale and encode share it. |
+| `UPSCALE_PLATFORM_TIMEOUT` | What the platform kills a job at, in seconds; 0 = nothing does (default 600). The guard runs at `min(FFMPEG_TIMEOUT, this - margin)` so it fires BEFORE the platform. Set by `deploy.sh`; pinned to 0 in the serve image. |
+| `UPSCALE_PLATFORM_MARGIN` | Seconds of headroom under the platform ceiling (default 30). |
 | `UPSCALE_BATCH` | Frames upscaled at once (default 16); lower it on a smaller card. On a CUDA out-of-memory the handler auto-splits the batch (down to 1 frame) and retries, so a heavy model never hard-fails. |
 | `UPSCALE_TILE` | Tile size in px (default 512); trades VRAM for speed. Keep it below the frame size so tiling actually subdivides -- a heavy 4x model (RealESRGAN_x4plus) needs this to fit. x4plus at 512 wants a large card (>= ~80 GB); use `UPSCALE_TILE=256` on a smaller (~48 GB) card. |
 | `UPSCALE_TILE_FLOOR` | Smallest tile the auto-shrink fallback drops to (default 64 px). If a single frame will not fit even after the batch split reaches 1, the handler halves the tile down to this floor so a small card still finishes instead of hard-failing. |
