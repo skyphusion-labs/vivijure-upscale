@@ -66,7 +66,11 @@ means and why.
 - **`IDLE_TIMEOUT`** (default `5`) -- seconds a worker stays warm after a job before it shuts down.
   Why: a small warm window avoids a cold start if a second clip arrives right away.
 - **`EXECUTION_TIMEOUT_MS`** (default `600000`) -- the longest a single job may run, in milliseconds
-  (600000 = 10 minutes). Why: a stuck job is cut off instead of billing forever.
+  (600000 = 10 minutes). Why: a stuck job is cut off instead of billing forever. The script also passes
+  this value, in seconds, to the container as `UPSCALE_PLATFORM_TIMEOUT`, so the handler can size its
+  own wall-clock guard to expire just UNDER it. That ordering matters: RunPod cutting the job off
+  produces a failure with no structured output, which the studio must treat as a crash and which fails
+  the whole film, while the handler's own guard degrades one shot and passes the original clip through.
 - **`CONTAINER_REGISTRY_AUTH_ID`** (default empty) -- a RunPod credential id for a **private** image.
   Why: if your image is private, RunPod needs a login to pull it. Make one in the RunPod console
   (Settings, then Container Registry Auth) and paste its id here. Leave blank for a public image.
@@ -88,8 +92,17 @@ you set them). The defaults are good for most cards.
 - **`MAX_OUTPUT_LONG_EDGE`** (default `3840`) -- the biggest the long side of the output may be, in
   pixels (3840 = 4K UHD). Why: the model is 4x native, so a 4x of 1080p would be 8K; this cap keeps the
   encode and memory sane no matter the source. Example: `MAX_OUTPUT_LONG_EDGE=3840`.
-- **`FFMPEG_TIMEOUT`** (default `1200`) -- a per-step wall-clock guard, in seconds. Why: a pathological
+- **`FFMPEG_TIMEOUT`** (default `1200`) -- the wall-clock guard for one upscale, in seconds, covering
+  probe, decode, GPU upscale and encode together (not per step, despite the name). Why: a pathological
   clip degrades (passes the original through) instead of hanging. Example: `FFMPEG_TIMEOUT=1200`.
+- **`UPSCALE_PLATFORM_TIMEOUT`** (default `600`) -- what the container believes the PLATFORM will kill a
+  job at, in seconds; `0` means nothing will. You do not normally set this: `deploy.sh` derives it from
+  `EXECUTION_TIMEOUT_MS`, and the homelab serve image pins it to `0`. The guard runs at
+  `min(FFMPEG_TIMEOUT, UPSCALE_PLATFORM_TIMEOUT - UPSCALE_PLATFORM_MARGIN)`, so with the defaults it is
+  570 seconds, not 1200. Why it is not simply `FFMPEG_TIMEOUT`: a guard set above the platform's own
+  ceiling can never fire, and the platform's kill is the outcome that fails the film.
+- **`UPSCALE_PLATFORM_MARGIN`** (default `30`) -- how far under the platform ceiling the guard sits, in
+  seconds. Why: the handler needs time to finish returning its degrade before the platform cuts in.
 - **`UPSCALE_BATCH`** (default `16`) -- how many frames the GPU upscales at once. Why: bigger batches
   keep the GPU busier but use more VRAM. Lower it on a smaller card. On a CUDA out-of-memory the handler
   automatically splits the batch (halving down to a single frame, freeing the cache between tries) and

@@ -28,9 +28,21 @@ Job input (presigned mode):
     "scale":      2,
     "model":      "realesr-animevideov3"
   }
-Returns: { ok, output_key, bytes, scale, model, frames, encoder } on success; { ok: false, error }
-otherwise. The upscale module treats a non-ok result as a soft-degrade (passthrough the original) --
-never a drop. Every ffmpeg phase is wall-clock guarded so a pathological clip degrades instead of hanging.
+Returns: { ok, output_key, bytes, scale, model, frames, encoder } on success. Two non-ok shapes, and
+the difference is deliberate (#105):
+  { ok: false, detail: "<reason>" }  the WALL-CLOCK GUARD expired -- an honest soft degrade. `detail`
+                                    is the key vivijure-cf's degradeReason reads first, and it does
+                                    NOT get lifted into a RunPod FAILED envelope, so an honest degrade
+                                    stops booking a `failed` job row that the telemetry then believes.
+  { ok: false, error:  "<reason>" }  an ordinary error (bad key, no frames, encode rc). Legacy shape,
+                                    also recovered by the panel, but via the FAILED envelope.
+Either way the module passes the original clip through -- never a drop.
+
+THE WALL-CLOCK GUARD covers the WHOLE of _upscale_video: probe, nvenc probe, decode, upscale, encode,
+and the wait() on both children. It is enforced ON the child processes (a watchdog that kills them),
+not only by checks between steps, because a write to a full pipe and a wait() on a stalled child both
+block in the kernel where the next check is never reached. Its budget is _invocation_budget(), which
+sits UNDER the platform execution ceiling rather than above it -- see that function.
 """
 
 import os
@@ -42,6 +54,7 @@ import os
 # operator-set PYTORCH_CUDA_ALLOC_CONF in the endpoint env always wins.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+import contextlib
 import shutil
 import subprocess
 import tempfile
@@ -80,9 +93,27 @@ HALF = (os.environ.get("UPSCALE_FP16", "1") or "1").lower() not in ("0", "false"
 # source would otherwise be 8K (7680x4320); the cap bounds the encode + the in-memory frame buffers
 # regardless of source size. Overridable via env for a deliberately larger render.
 MAX_LONG_EDGE = int(os.environ.get("MAX_OUTPUT_LONG_EDGE", "3840") or "3840")
-# Per-phase wall-clock guard (s). A phase that blows past this aborts and the job degrades (ok:false ->
-# module passthrough) instead of hanging to the RunPod execution-timeout.
+# Wall-clock guard (s) for ONE invocation of _upscale_video -- decode, upscale AND encode, not per
+# phase despite the historical name: it is stamped once and shared. A run that blows past it aborts and
+# the job degrades (ok:false + detail -> module passthrough) instead of hanging to the platform kill.
 FFMPEG_TIMEOUT = int(os.environ.get("FFMPEG_TIMEOUT", "1200") or "1200")
+# What the CONTAINER believes the PLATFORM's own execution ceiling to be, in seconds; 0 = none.
+# deploy.sh derives it from the same EXECUTION_TIMEOUT_MS it sets on the endpoint so the two cannot
+# drift, and Dockerfile.serve pins it to 0 because the homelab serve door has no platform kill at all.
+PLATFORM_TIMEOUT = int(os.environ.get("UPSCALE_PLATFORM_TIMEOUT", "600") or "600")
+# How far under the platform ceiling this module's own guard sits, so the guard gets there FIRST and
+# the outcome is an honest degrade rather than a structureless platform kill.
+PLATFORM_MARGIN = int(os.environ.get("UPSCALE_PLATFORM_MARGIN", "30") or "30")
+# Bound for the short probe/utility subprocesses (ffprobe, the test clip generator). Every
+# subprocess.run in this file passes a timeout; see _run_bounded.
+PROBE_TIMEOUT = int(os.environ.get("UPSCALE_PROBE_TIMEOUT", "60") or "60")
+# Explicit transport bounds for the R2 client. botocore's own defaults are a bound, but they are a
+# default rather than a declaration, and the invocation ceiling has to be readable from this file.
+R2_CONNECT_TIMEOUT = int(os.environ.get("R2_CONNECT_TIMEOUT", "30") or "30")
+R2_READ_TIMEOUT = int(os.environ.get("R2_READ_TIMEOUT", "120") or "120")
+R2_MAX_ATTEMPTS = int(os.environ.get("R2_MAX_ATTEMPTS", "3") or "3")
+
+GUARD_NAME = "upscale-invocation-guard"  # rides in the degrade reason; first 120 chars are all that survive
 
 _MODELS = {}  # name -> loaded spandrel descriptor (warm-worker cache)
 _NVENC = None  # tri-state cache: None = unprobed, True/False = h264_nvenc usable on this worker
@@ -92,9 +123,154 @@ def _device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _run(cmd, timeout=FFMPEG_TIMEOUT):
-    """subprocess.run with a hard wall-clock guard, used for the short probe/utility ffmpeg calls."""
-    return subprocess.run(cmd, check=True, timeout=timeout)
+def _invocation_budget():
+    """The wall-clock seconds ONE _upscale_video invocation gets, and why it is not just FFMPEG_TIMEOUT.
+
+    A guard set ABOVE the platform's own execution ceiling never fires: the platform gets there first,
+    and its kill produces a job-level FAILED envelope with NO structured output. vivijure-cf's poll-path
+    discriminator correctly refuses to absorb that (a real crash must keep failing loud), so the whole
+    film dies -- the outcome the guard exists to prevent. MEASURED: deploy.sh has passed
+    executionTimeoutMs=600000 (600s) on every endpoint it creates since 2026-07-01, while FFMPEG_TIMEOUT
+    defaults to 1200. The guard was set at twice the ceiling it was meant to sit under, so its default
+    was decoration on any endpoint this repo's own script deploys.
+
+    With the defaults that resolves to min(1200, 600-30) = 570s, which fires under BOTH readings of an
+    endpoint reporting `timeout: 0` (600s platform default, or no platform limit at all). PLATFORM_TIMEOUT
+    0 means there is genuinely no platform ceiling -- the homelab serve door -- and that deployment keeps
+    the full FFMPEG_TIMEOUT.
+
+    Both bounds this value has to satisfy are asserted in tests/test_invocation_guard_105.py:
+      (a) budget < the platform ceiling, or the guard cannot fire;
+      (b) FINISH_STEP_MAX_ATTEMPTS (3) * budget < PHASE_HARD_DEADLINE_SECONDS (5400), because
+          vivijure-core FLOORS the phase deadline at max(5400, 3 * longest declared) -- it does not cap
+          it -- so a larger budget silently RAISES the stall ceiling for every film whose chain contains
+          this door, rather than failing a check.
+    """
+    if PLATFORM_TIMEOUT <= 0:
+        return FFMPEG_TIMEOUT
+    return max(0, min(FFMPEG_TIMEOUT, PLATFORM_TIMEOUT - PLATFORM_MARGIN))
+
+
+class InvocationExpired(BaseException):
+    """The invocation's wall-clock budget ran out.
+
+    DERIVED FROM BaseException RATHER THAN Exception, and that is the whole point (#105). Every job path
+    in this file ends in a broad `except Exception` that turns anything into {"ok": false, "error": ...}.
+    A guard whose expiry is an ordinary Exception is swallowed there, re-keyed to the legacy shape, and
+    reported as an ordinary failure -- present, tested, and inert on the exact path it was written for.
+    BaseException means no existing or future broad handler has to REMEMBER to re-raise it. The three job
+    boundaries catch it explicitly and return the soft-degrade shape.
+
+    `finally` blocks still run, so the abort-path CUDA cache release (#98) is unaffected; that is
+    asserted rather than assumed.
+    """
+
+
+class _Deadline:
+    """One wall-clock budget for the WHOLE invocation: checked between steps, and enforced ON the child
+    processes by _guarded_child."""
+
+    def __init__(self, seconds, label=GUARD_NAME):
+        self.seconds = int(seconds)
+        self.label = label
+        self.started = time.monotonic()
+        self.expires = self.started + seconds
+
+    def elapsed(self):
+        return time.monotonic() - self.started
+
+    def remaining(self):
+        return self.expires - time.monotonic()
+
+    def expired(self):
+        return time.monotonic() > self.expires
+
+    def child_timeout(self, floor=0.05):
+        """Seconds a child may still have. Floored above zero so an already-expired budget still makes a
+        real bounded call rather than a zero-timeout one."""
+        return max(floor, self.remaining())
+
+    def reason(self, step):
+        """The degrade reason. vivijure-cf truncates it at 120 chars (modules/_shared/
+        finish-soft-degrade.ts degradeReason), so the guard name, the step and the elapsed seconds are
+        ordered to all fit inside the first 120."""
+        return f"{self.label}: {step} exceeded {self.seconds}s budget (elapsed {self.elapsed():.1f}s)"[:120]
+
+    def check(self, step):
+        if self.expired():
+            raise InvocationExpired(self.reason(step))
+
+
+@contextlib.contextmanager
+def _guarded_child(proc, deadline, step):
+    """Arm a wall-clock watchdog that KILLS `proc` when the budget runs out; disarm it on exit.
+
+    A deadline check between loop iterations cannot interrupt a write to a full pipe or a wait() on a
+    stalled child: both block in the kernel and the next check is never reached. Killing the child is
+    what unblocks them (the write raises BrokenPipeError, the wait returns), so the guard has to ACT ON
+    the process, not merely observe the clock. Yields a state dict whose `fired` is what the caller
+    judges on -- a killed child also looks like an ordinary non-zero exit, so rc alone cannot tell the
+    two apart, and reporting a kill as `encode pipe exited rc=-9` would hide the guard from the operator
+    it fired for."""
+    state = {"fired": False, "step": step}
+
+    def _kill():
+        state["fired"] = True
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001 -- already gone is the outcome we wanted
+            pass
+
+    timer = threading.Timer(deadline.child_timeout(), _kill)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield state
+    finally:
+        timer.cancel()
+
+
+def _reap(proc, deadline):
+    """Bounded wait for a child, then kill it if it will not go. NEVER raises: it runs in `finally`
+    blocks and must not mask the exception that got us there. Returns the exit code, or None when it
+    could not be established."""
+    try:
+        return proc.wait(timeout=deadline.child_timeout())
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            return proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            return None
+    except Exception:  # noqa: BLE001 -- a stub or an already-reaped child; the caller judges on `fired`
+        return None
+
+
+def _run_bounded(cmd, timeout, **kw):
+    """subprocess.run with a MANDATORY wall-clock bound.
+
+    `timeout` has no default ON PURPOSE. The helper this replaces defaulted it to FFMPEG_TIMEOUT and had
+    ZERO callers anywhere in the repo (measured at d34135d) -- every subprocess.run in the file went
+    around it. A convention nobody calls still reads as one: the file appeared to bound its subprocesses
+    because a bounded helper existed next to them. Requiring the argument is what makes an unbounded call
+    impossible to write by omission."""
+    return subprocess.run(cmd, timeout=timeout, **kw)
+
+
+def _bounded_probe(cmd, deadline, timeout, step):
+    """Run a short probe/utility subprocess under BOTH its own bound and the invocation budget, and
+    convert either overrun into the guard's degrade rather than an ordinary error -- a probe that hangs is
+    the same operator-visible event as an encode that hangs."""
+    t = min(timeout, deadline.child_timeout()) if deadline is not None else timeout
+    try:
+        return _run_bounded(cmd, timeout=t, capture_output=True, text=True)
+    except subprocess.TimeoutExpired:
+        if deadline is not None and deadline.expired():
+            raise InvocationExpired(deadline.reason(step)) from None
+        raise InvocationExpired(f"{GUARD_NAME}: {step} exceeded its {int(t)}s bound"[:120]) from None
 
 
 def _probe_nvenc():
@@ -102,15 +278,15 @@ def _probe_nvenc():
     (e.g. an old Ubuntu build) can list the encoder yet fail at runtime on some GPU/driver combos, so a
     real test encode is the only honest check; the chosen encoder is reported. Cached on the warm worker."""
     try:
-        enc = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
-                             capture_output=True, text=True, timeout=30)
+        enc = _run_bounded(["ffmpeg", "-hide_banner", "-encoders"],
+                           timeout=30, capture_output=True, text=True)
         if "h264_nvenc" not in (enc.stdout or ""):
             return False
-        test = subprocess.run(
+        test = _run_bounded(
             ["ffmpeg", "-hide_banner", "-v", "error", "-y", "-f", "lavfi",
              "-i", "testsrc=size=320x240:rate=10:duration=1",
              "-c:v", "h264_nvenc", "-f", "null", "-"],
-            capture_output=True, text=True, timeout=60)
+            timeout=60, capture_output=True, text=True)
         return test.returncode == 0
     except Exception:  # noqa: BLE001 -- any probe failure means "not usable", fall back honestly
         return False
@@ -260,20 +436,22 @@ def _upscale_batch(model, frames_np, out_w, out_h, start_tile=None):
     return out.cpu().numpy(), used["tile"]  # (N,out_h,out_w,3), tile the pass settled on
 
 
-def _ffprobe(path, entries):
-    p = subprocess.run(
+def _ffprobe(path, entries, deadline=None, timeout=PROBE_TIMEOUT):
+    """`deadline` is threaded in from _upscale_video so the probes count against the SAME budget as the
+    work they precede; the selftest's reporting probes pass none and take the plain PROBE_TIMEOUT."""
+    p = _bounded_probe(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", entries, "-of", "default=nw=1:nk=1", path],
-        capture_output=True, text=True,
+        deadline, timeout, "probe",
     )
     return [ln for ln in (p.stdout or "").strip().splitlines() if ln]
 
 
-def _has_audio(path):
-    p = subprocess.run(
+def _has_audio(path, deadline=None, timeout=PROBE_TIMEOUT):
+    p = _bounded_probe(
         ["ffprobe", "-v", "error", "-select_streams", "a",
          "-show_entries", "stream=index", "-of", "csv=p=0", path],
-        capture_output=True, text=True,
+        deadline, timeout, "probe",
     )
     return bool((p.stdout or "").strip())
 
@@ -291,18 +469,26 @@ def _read_exact(stream, n):
     return b"".join(parts)
 
 
-def _upscale_video(model, src, dst, final_scale):
+def _upscale_video(model, src, dst, final_scale, budget=None):
     """Decode -> batched GPU upscale + GPU resize -> re-encode, entirely through ffmpeg rawvideo pipes
     (no PNG disk roundtrip). Audio is copied when present. Returns a dict: frames, encoder, out dims,
-    per-phase seconds (decode/upscale/encode), and the batch/fp16 settings actually used."""
-    fps = (_ffprobe(src, "stream=r_frame_rate") or ["24/1"])[0]
-    wh = _ffprobe(src, "stream=width,height")
+    per-phase seconds (decode/upscale/encode), the budget the run was held to, and the batch/fp16
+    settings actually used.
+
+    ONE deadline covers every step, and it is STAMPED FIRST so the probes are inside it too. Before
+    #105 it was stamped after the probes and after the nvenc probe, and it was checked in exactly two
+    places (decode and upscale): the encode step -- a raw Popen, a write loop, and an unbounded
+    enc.wait() -- sat outside it entirely, so the invocation was never capped by anything. `budget`
+    is injectable for tests; production passes none and gets _invocation_budget()."""
+    deadline = _Deadline(budget if budget is not None else _invocation_budget())
+    fps = (_ffprobe(src, "stream=r_frame_rate", deadline=deadline) or ["24/1"])[0]
+    wh = _ffprobe(src, "stream=width,height", deadline=deadline)
     sw, sh = (int(wh[0]), int(wh[1])) if len(wh) >= 2 else (0, 0)
     if not (sw and sh):
         raise RuntimeError("could not probe source dimensions")
     out_w, out_h = _capped(sw * final_scale, sh * final_scale, MAX_LONG_EDGE)
-    encoder = "h264_nvenc" if _nvenc_available() else "libx264"
-    deadline = time.monotonic() + FFMPEG_TIMEOUT
+    encoder = "h264_nvenc" if _nvenc_available() else "libx264"  # bounded at 30s + 60s inside _probe_nvenc
+    deadline.check("nvenc-probe")
     fsize = sw * sh * 3
 
     # --- decode (no disk): pull raw rgb24 frames from an ffmpeg pipe into memory ---
@@ -311,17 +497,23 @@ def _upscale_video(model, src, dst, final_scale):
         ["ffmpeg", "-v", "error", "-i", src, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
         stdout=subprocess.PIPE, bufsize=max(fsize, 1 << 20))
     inputs = []
-    try:
-        while True:
-            buf = _read_exact(dec.stdout, fsize)
-            if buf is None:
-                break
-            inputs.append(buf)
-            if time.monotonic() > deadline:
-                raise TimeoutError("decode exceeded FFMPEG_TIMEOUT")
-    finally:
-        dec.stdout.close()
-        dec.wait()
+    with _guarded_child(dec, deadline, "decode") as dec_guard:
+        try:
+            while True:
+                buf = _read_exact(dec.stdout, fsize)
+                if buf is None:
+                    break
+                inputs.append(buf)
+                deadline.check("decode")
+        finally:
+            # The read above blocks in the kernel on a stalled decoder, where no check is reached; the
+            # watchdog kills the child and the read returns. dec.wait() used to be unbounded here, so a
+            # decoder that ignored the closed pipe hung the invocation on the ABORT path -- the guard's
+            # own exit route.
+            dec.stdout.close()
+            _reap(dec, deadline)
+    if dec_guard["fired"]:
+        raise InvocationExpired(deadline.reason("decode"))
     if not inputs:
         raise RuntimeError("no frames decoded from source")
     t1 = time.monotonic()
@@ -340,8 +532,7 @@ def _upscale_video(model, src, dst, final_scale):
             outputs.extend(np.ascontiguousarray(f).tobytes() for f in outs)
             for j in range(i, min(i + BATCH, len(inputs))):
                 inputs[j] = None
-            if time.monotonic() > deadline:
-                raise TimeoutError("upscale exceeded FFMPEG_TIMEOUT")
+            deadline.check("upscale")
     finally:
         # RELEASED ON EVERY EXIT PATH, INCLUDING THE TIMEOUT (#98). This used to sit after the loop, so
         # the `raise TimeoutError` above jumped straight over it and the allocator kept its reservation
@@ -368,7 +559,7 @@ def _upscale_video(model, src, dst, final_scale):
     enc_cmd = ["ffmpeg", "-v", "error", "-y",
                "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{out_w}x{out_h}",
                "-framerate", fps, "-i", "-"]
-    if _has_audio(src):
+    if _has_audio(src, deadline=deadline):
         enc_cmd += ["-i", src, "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-shortest"]
     if encoder == "h264_nvenc":
         enc_cmd += ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "19", "-pix_fmt", "yuv420p"]
@@ -376,12 +567,26 @@ def _upscale_video(model, src, dst, final_scale):
         enc_cmd += ["-c:v", "libx264", "-crf", "19", "-preset", "fast", "-pix_fmt", "yuv420p"]
     enc_cmd += [dst]
     enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE)
-    try:
-        for fb in outputs:
-            enc.stdin.write(fb)
-    finally:
-        enc.stdin.close()
-        rc = enc.wait()
+    rc = None
+    with _guarded_child(enc, deadline, "encode") as enc_guard:
+        try:
+            for fb in outputs:
+                deadline.check("encode")
+                enc.stdin.write(fb)
+        except BrokenPipeError:
+            # The watchdog killed the encoder mid-write, which is HOW a blocked write is interrupted.
+            # A broken pipe with the watchdog silent is a genuine encoder crash and still fails loud.
+            if not enc_guard["fired"]:
+                raise
+        finally:
+            with contextlib.suppress(Exception):
+                enc.stdin.close()
+            rc = _reap(enc, deadline)
+    # EXPIRY IS JUDGED BEFORE rc. A killed encoder exits non-zero, so rc alone reports the guard firing
+    # as `encode pipe exited rc=-9` -- an ordinary error, hiding the ceiling from the operator it fired
+    # for, and taking the FAILED-envelope route instead of the honest degrade.
+    if enc_guard["fired"]:
+        raise InvocationExpired(deadline.reason("encode"))
     if rc != 0:
         raise RuntimeError(f"encode pipe exited rc={rc}")
     t3 = time.monotonic()
@@ -392,6 +597,7 @@ def _upscale_video(model, src, dst, final_scale):
         "extract_s": round(t1 - t0, 2),
         "upscale_s": round(t2 - t1, 2),
         "encode_s": round(t3 - t2, 2),
+        "budget_s": deadline.seconds,  # the CONFIGURED value this run was held to, never the literal default
         "batch": BATCH, "fp16": bool(HALF and torch.cuda.is_available()),
         "tile": TILE, "tile_min": tile_min, "tile_shrank": tile_min < TILE,
     }
@@ -418,10 +624,10 @@ class _GpuSampler(threading.Thread):
         # (utilization.encoder is NOT a --query-gpu field, so encoder util is read separately below.)
         # Any failure is swallowed -- sampling is best effort and never fails the job.
         try:
-            p = subprocess.run(
+            p = _run_bounded(
                 ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
                  "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=5)
+                timeout=5, capture_output=True, text=True)
             row = (p.stdout or "").strip().splitlines()
             if not row:
                 return
@@ -438,8 +644,8 @@ class _GpuSampler(threading.Thread):
         # Encoder-engine utilization is not in --query-gpu; read the Utilization section of `-q`.
         # Returns None if the field is absent on this driver (then it is just omitted from the report).
         try:
-            p = subprocess.run(["nvidia-smi", "-q", "-d", "UTILIZATION"],
-                               capture_output=True, text=True, timeout=5)
+            p = _run_bounded(["nvidia-smi", "-q", "-d", "UTILIZATION"],
+                             timeout=5, capture_output=True, text=True)
             for ln in (p.stdout or "").splitlines():
                 key, sep, val = ln.partition(":")
                 if sep and key.strip() == "Encoder":
@@ -522,10 +728,10 @@ def _selftest_one(model_name, final_scale, res="1280x720", dur=3):
         dur = max(1, min(int(dur or 3), 30))
         out["requested_res"], out["requested_dur"] = f"{gw}x{gh}", dur
         # A real multi-second clip (default 720p24 x 3s = 72 frames) so the GPU work + encode are non-trivial.
-        gen = subprocess.run(
+        gen = _run_bounded(
             ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
              "-i", f"testsrc=size={gw}x{gh}:rate=24:duration={dur}", "-pix_fmt", "yuv420p", src],
-            capture_output=True, text=True,
+            timeout=PROBE_TIMEOUT, capture_output=True, text=True,
         )
         if gen.returncode != 0:
             out["error"] = f"ffmpeg gen failed: {(gen.stderr or '')[-500:]}"
@@ -556,6 +762,10 @@ def _selftest_one(model_name, final_scale, res="1280x720", dur=3):
         out["scale"] = final_scale
         out["ok"] = True
         return out
+    except InvocationExpired as e:  # BaseException-derived: the broad handler below cannot see it
+        out["error"] = str(e)[:800]  # a selftest reports diagnostics, not a chain degrade
+        out["guard_expired"] = True
+        return out
     except Exception as e:  # noqa: BLE001 -- a job error is data, returned to the caller
         out["error"] = str(e)[:800]
         return out
@@ -572,10 +782,20 @@ R2_BUCKET = os.environ.get("R2_BUCKET", "vivijure")
 
 
 def _r2():
+    """The R2 client, with its transport bounds DECLARED rather than defaulted.
+
+    The bytes in and out of the bucket sit OUTSIDE the _upscale_video deadline by design: that budget
+    is the GPU/ffmpeg work, and stretching it over a network transfer would make one number mean two
+    things. They are bounded here instead, so the whole invocation has a stated ceiling. The botocore
+    import is local because botocore is a boto3 transitive dep that the hermetic tests (which stub
+    boto3 and monkeypatch this function) do not install."""
+    from botocore.config import Config
     return boto3.client(
         "s3", endpoint_url=R2_ENDPOINT, region_name="auto",
         aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID", ""),
         aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY", ""),
+        config=Config(connect_timeout=R2_CONNECT_TIMEOUT, read_timeout=R2_READ_TIMEOUT,
+                      retries={"max_attempts": R2_MAX_ATTEMPTS, "mode": "standard"}),
     )
 
 
@@ -674,6 +894,18 @@ def _upscale_r2(inp):
         return {"ok": True, "clip_key": output_key, "bytes": os.path.getsize(dst),
                 "scale": final_scale, "model": model_name, "frames": info["frames"],
                 "encoder": info["encoder"], "applied": [f"upscale:{final_scale}x"]}
+    except InvocationExpired as e:
+        # THE SOFT-DEGRADE SHAPE, and both halves of it are load-bearing (#105).
+        # RETURN, NEVER RAISE: a raise leaves the RunPod envelope with no structured output, which
+        # vivijure-cf's discriminator correctly refuses to absorb, so the whole FILM fails after the GPU
+        # spend is already banked -- strictly worse than the hang this guard replaces, since the hang is
+        # at least recoverable by the core's phase ceiling.
+        # `detail`, NOT `error`: degradeReason reads `detail` first (vivijure-cf
+        # modules/_shared/finish-soft-degrade.ts:77), and a top-level `error` is lifted by RunPod into a
+        # FAILED envelope which books a `failed` job row for a job that degraded honestly. Ordinary
+        # errors below keep `error` on purpose -- they ARE failures, and the legacy shape is still
+        # recovered by the panel's FAILED-envelope route.
+        return {"ok": False, "detail": str(e)[:120]}
     except Exception as e:  # noqa: BLE001 -- a job error is data, returned to the caller
         return {"ok": False, "error": str(e)[:500]}
     finally:
@@ -702,10 +934,10 @@ def _selftest_r2(final_scale, model_name, requested):
     s3 = _r2()
     leg = {"ok": False, "clip_key": clip_key, "output_key": output_key, "bucket": R2_BUCKET}
     try:
-        gen = subprocess.run(
+        gen = _run_bounded(
             ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
              "-i", "testsrc=size=320x240:rate=12:duration=1", "-pix_fmt", "yuv420p", src],
-            capture_output=True, text=True,
+            timeout=PROBE_TIMEOUT, capture_output=True, text=True,
         )
         if gen.returncode != 0:
             leg["error"] = f"ffmpeg gen failed: {(gen.stderr or '')[-300:]}"
@@ -714,7 +946,9 @@ def _selftest_r2(final_scale, model_name, requested):
         res = _upscale_r2({"project": "_selftest", "clip_key": clip_key, "output_key": output_key,
                            "scale": final_scale, "model": model_name})
         if not res.get("ok"):
-            leg["error"] = res.get("error", "_upscale_r2 returned not-ok")
+            # `detail` is the guard's degrade key; without it a guard expiry here reads as an
+            # unexplained not-ok and the selftest loses the one fact that mattered.
+            leg["error"] = res.get("error") or res.get("detail") or "_upscale_r2 returned not-ok"
             return leg
         head = s3.head_object(Bucket=R2_BUCKET, Key=output_key)  # prove the object actually landed
         leg["ok"] = True
@@ -770,6 +1004,8 @@ def handler(job):
         return {"ok": True, "output_key": output_key, "bytes": size,
                 "scale": final_scale, "model": model_name, "frames": info["frames"],
                 "encoder": info["encoder"]}
+    except InvocationExpired as e:  # same soft-degrade contract as the R2 path above
+        return {"ok": False, "detail": str(e)[:120]}
     except Exception as e:  # noqa: BLE001 -- a job error is data, returned to the caller
         return {"ok": False, "error": str(e)[:500]}
     finally:

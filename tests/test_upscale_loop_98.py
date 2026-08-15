@@ -73,17 +73,25 @@ def _load_handler(env=None):
 
 
 class _Pipe:
-    """Decoder stdout: hands out exactly `nframes` frames of `fsize` bytes, then a clean EOF."""
+    """Decoder stdout: hands out exactly `nframes` frames of `fsize` bytes, then a clean EOF.
 
-    def __init__(self, nframes, fsize):
+    `sleep_s` pushes real monotonic time forward INSIDE the decode loop, which is how the decode
+    deadline is now driven. Since #105 the budget is checked before decode too (at the nvenc probe), so
+    a zero budget no longer reaches the decode branch at all -- it trips one step earlier, and the test
+    below would have been asserting about a step it did not name."""
+
+    def __init__(self, nframes, fsize, sleep_s=0.0):
         self._left = nframes
         self._fsize = fsize
+        self._sleep_s = sleep_s
         self.closed = False
 
     def read(self, n):
         if self._left <= 0:
             return b""
         self._left -= 1
+        if self._sleep_s:
+            time.sleep(self._sleep_s)
         return b"\x00" * n
 
     def close(self):
@@ -94,12 +102,18 @@ class _Enc:
     def __init__(self):
         self.stdin = types.SimpleNamespace(write=lambda b: None, close=lambda: None)
         self.written = 0
+        self.killed = False
 
-    def wait(self):
+    # `timeout` and `kill` exist because the shipped code now bounds the wait and can kill the child
+    # (#105). A fake that does not accept them would make the guard untestable through this harness.
+    def wait(self, timeout=None):
         return 0
 
+    def kill(self):
+        self.killed = True
 
-def _wire(handler, monkeypatch, *, nframes, batch_tiles, w=8, h=8, batch_sleep_s=0.0):
+
+def _wire(handler, monkeypatch, *, nframes, batch_tiles, w=8, h=8, batch_sleep_s=0.0, read_sleep_s=0.0):
     """Point _upscale_video at fakes. `batch_tiles` is the tile each successive batch will SETTLE on,
     so a test can make the first batch shrink and then assert what the second batch was HANDED."""
     seen_start_tiles = []
@@ -114,12 +128,16 @@ def _wire(handler, monkeypatch, *, nframes, batch_tiles, w=8, h=8, batch_sleep_s
 
     def fake_popen(cmd, **kw):
         if "rawvideo" in cmd and cmd[-1] == "-":  # decode: ffmpeg ... -f rawvideo ... -
-            return types.SimpleNamespace(stdout=_Pipe(nframes, w * h * 3), wait=lambda: 0)
+            return types.SimpleNamespace(stdout=_Pipe(nframes, w * h * 3, read_sleep_s),
+                                        wait=lambda timeout=None: 0, kill=lambda: None)
         return _Enc()
 
-    monkeypatch.setattr(handler, "_ffprobe", lambda src, spec: (["24/1"] if "frame_rate" in spec else [str(w), str(h)]))
+    # **kw because the shipped probes now take the invocation deadline (#105); a fake with the old
+    # signature would fail the call rather than exercise the loop.
+    monkeypatch.setattr(handler, "_ffprobe",
+                        lambda src, spec, **kw: (["24/1"] if "frame_rate" in spec else [str(w), str(h)]))
     monkeypatch.setattr(handler, "_nvenc_available", lambda: False)
-    monkeypatch.setattr(handler, "_has_audio", lambda src: False)
+    monkeypatch.setattr(handler, "_has_audio", lambda src, **kw: False)
     monkeypatch.setattr(handler, "_upscale_batch", fake_upscale_batch)
     monkeypatch.setattr(handler.subprocess, "Popen", fake_popen)
     return seen_start_tiles
@@ -165,9 +183,11 @@ def test_the_timeout_path_releases_the_cuda_cache(monkeypatch):
     specific refusal instead of accepting any TimeoutError."""
     handler, calls = _load_handler({"UPSCALE_BATCH": 2, "UPSCALE_TILE": 512, "FFMPEG_TIMEOUT": 1})
     _wire(handler, monkeypatch, nframes=6, batch_tiles=[512, 512, 512], batch_sleep_s=1.2)
-    with pytest.raises(TimeoutError) as e:
+    # InvocationExpired rather than TimeoutError since #105: TimeoutError is an Exception, so every
+    # broad `except Exception` on the job paths swallowed it and re-keyed the degrade.
+    with pytest.raises(handler.InvocationExpired) as e:
         handler._upscale_video(object(), "in.mp4", "out.mp4", 2)
-    assert "upscale exceeded FFMPEG_TIMEOUT" in str(e.value), "wrong branch: this is not the leak path"
+    assert "upscale exceeded" in str(e.value), "wrong branch: this is not the leak path"
     assert calls["empty_cache"] == 1, "the abort path must release the allocator's reservation"
     assert calls["synchronize"] == 1
 
@@ -177,11 +197,11 @@ def test_the_decode_timeout_path_is_documented_not_assumed(monkeypatch):
     correct rather than an oversight: at that point the only CUDA allocation is the model weights,
     which are ALLOCATED, not cached, and `empty_cache()` does not free them. Asserting the behaviour
     here means the next reader does not have to guess whether this branch was considered."""
-    handler, calls = _load_handler({"UPSCALE_BATCH": 2, "UPSCALE_TILE": 512, "FFMPEG_TIMEOUT": 0})
-    _wire(handler, monkeypatch, nframes=6, batch_tiles=[512, 512, 512])
-    with pytest.raises(TimeoutError) as e:
+    handler, calls = _load_handler({"UPSCALE_BATCH": 2, "UPSCALE_TILE": 512, "FFMPEG_TIMEOUT": 1})
+    _wire(handler, monkeypatch, nframes=6, batch_tiles=[512, 512, 512], read_sleep_s=0.6)
+    with pytest.raises(handler.InvocationExpired) as e:
         handler._upscale_video(object(), "in.mp4", "out.mp4", 2)
-    assert "decode exceeded FFMPEG_TIMEOUT" in str(e.value)
+    assert "decode exceeded" in str(e.value)
     assert calls["empty_cache"] == 0
 
 
