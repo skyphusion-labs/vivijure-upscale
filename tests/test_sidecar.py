@@ -52,10 +52,12 @@ class _FakeS3:
         self.order.append(("sidecar", Key))
 
 
-def _run_ok(model, src, dst, final_scale):
+def _run_ok(model, src, dst, final_scale, budget=None, target_height=None):
     with open(dst, "wb") as f:
         f.write(b"video-bytes")
-    return {"frames": 10, "encoder": "libx264"}
+    # Default 2x of a 540p source -- the one size where honoured-1080 and ignored-scale
+    # are indistinguishable, so a test that only looks at ok:true cannot catch #102.
+    return {"frames": 10, "encoder": "libx264", "out_w": 1920, "out_h": 1080, "scale": 2}
 
 
 R2_JOB = {

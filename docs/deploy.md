@@ -147,11 +147,11 @@ the presigned-URL mode, where the studio hands the endpoint short-lived links in
 You do not call this by hand in normal use; the studio does. But so you know exactly what it does,
 here is the contract.
 
-- **R2 finish-chain mode:** `{ "clip_key": "...", "output_key": "...", "scale": 2,
+- **R2 finish-chain mode:** `{ "clip_key": "...", "output_key": "...", "target_height": 1080,
   "model": "realesr-animevideov3" }`. The endpoint reads the clip from R2 and writes the result to
   `output_key`.
-- **Presigned mode:** `{ "video_url": "...", "output_url": "...", "output_key": "...", "scale": 2 }`.
-  The studio presigns the links; the endpoint holds no keys.
+- **Presigned mode:** `{ "video_url": "...", "output_url": "...", "output_key": "...",
+  "target_height": 1080 }`. The studio presigns the links; the endpoint holds no keys.
 - **Self-test:** `{ "selftest": true, "scale": 2 }`. Upscales a generated clip end to end and reports
   which encoder ran, the GPU use, and the timing, so you can prove a fresh endpoint is GPU-bound. With no
   `model` it SWEEPS every shipped model on the real GPU (so a heavy model like `RealESRGAN_x4plus` is
@@ -164,10 +164,16 @@ here is the contract.
   generated test clip -- a large `res` paired with a large `UPSCALE_TILE` exercises the tile-shrink
   fallback on a small card.
 
-Two job knobs you can pass:
+Three job knobs you can pass:
 
-- **`scale`** (default `2`) -- how much bigger to make the video, `2` or `4`. Why: `2` doubles the
-  resolution, `4` quadruples it. Anything `4` or higher is treated as `4`. Example: `scale: 2`.
+- **`target_height`** -- the exact output height in px. Why: the studio asks for 1080p, not "2x
+  whatever the source was". The engine upscales at native 4x and GPU-resizes to this height. A
+  request it cannot satisfy (more than 4x the source, a downscale, already at that height, or
+  larger than `MAX_OUTPUT_LONG_EDGE`) is refused rather than silently substituted. Example:
+  `target_height: 1080`.
+- **`scale`** (default `2` when `target_height` is also absent) -- how much bigger to make the
+  video, `2` or `4` only. Why: `2` doubles the resolution, `4` quadruples it. Anything else is
+  refused (it used to collapse to 2 or 4 and still report success). Example: `scale: 2`.
 - **`model`** (default `realesr-animevideov3`) -- which Real-ESRGAN model to use. Why:
   `realesr-animevideov3` is fast and great for animation; `RealESRGAN_x4plus` is a general-purpose 4x
   model. Example: `model: "realesr-animevideov3"`.

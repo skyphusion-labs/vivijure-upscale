@@ -7,8 +7,11 @@ harness are UNCHANGED from the Vulkan attempt -- only the engine swapped.
 The pipeline is GPU-bound end to end: frames are streamed through ffmpeg pipes (raw rgb24 in and out --
 NO per-frame PNG disk roundtrip), upscaled in BATCHES on the GPU (fp16 via autocast), the final-size
 rescale runs on the GPU, and the re-encode uses NVENC (`h264_nvenc`) when the card + ffmpeg support it.
-The output resolution is clamped (model is 4x native, but a 2x request is rescaled to 2x on the GPU, not
-4x-then-CPU-downscale) and the long edge is capped (default 2160p / 4K UHD). If NVENC is not usable on
+Sizing is one function (`_resolve_output_size`). `target_height` is the studio contract (exact
+output height via the existing GPU interpolate after native 4x). `scale` is only 2 or 4 -- a
+value that is not either is refused, never collapsed. An unsatisfiable request (beyond 4x, a
+downscale, a long-edge cap that would change a requested height) returns ok:false rather than a
+wrong-sized ok:true. If NVENC is not usable on
 this image, encode HONESTLY falls back to a bounded libx264 (the resolution cap keeps the CPU encode
 bounded); the chosen encoder is reported in the result so a fallback is never silent.
 
@@ -17,7 +20,8 @@ Job input (R2 finish-chain mode -- shared bucket):
     "project":    "<project>",                               # required -- scopes every renders/ key
     "clip_key":   "renders/<project>/clips/<shot>.mp4",
     "output_key": "renders/<project>/clips/<shot>_up.mp4",   # optional
-    "scale":      2,
+    "target_height": 1080,                                   # studio sends this; exact output height
+    "scale":      2,                                         # 2 or 4 only; ignored when target_height set
     "model":      "realesr-animevideov3"
   }
 Job input (presigned mode):
@@ -25,10 +29,11 @@ Job input (presigned mode):
     "video_url":  "<presigned R2 GET of the source clip>",
     "output_url": "<presigned R2 PUT for the result>",
     "output_key": "renders/<project>/clips/<shot>_up.mp4",   # echoed back
+    "target_height": 1080,
     "scale":      2,
     "model":      "realesr-animevideov3"
   }
-Returns: { ok, output_key, bytes, scale, model, frames, encoder } on success. Two non-ok shapes, and
+Returns: { ok, output_key, bytes, scale, out_w, out_h, model, frames, encoder } on success. Two non-ok shapes, and
 the difference is deliberate (#105):
   { ok: false, detail: "<reason>" }  the WALL-CLOCK GUARD expired -- an honest soft degrade. `detail`
                                     is the key vivijure-cf's degradeReason reads first, and it does
@@ -93,6 +98,10 @@ HALF = (os.environ.get("UPSCALE_FP16", "1") or "1").lower() not in ("0", "false"
 # source would otherwise be 8K (7680x4320); the cap bounds the encode + the in-memory frame buffers
 # regardless of source size. Overridable via env for a deliberately larger render.
 MAX_LONG_EDGE = int(os.environ.get("MAX_OUTPUT_LONG_EDGE", "3840") or "3840")
+# Models are 4x native. A 2x request is 4x inference GPU-downscaled to 2x. Any other integer
+# scale used to be silently collapsed to 2 or 4 (#102); that is a billed lie and is refused.
+ALLOWED_SCALES = (2, 4)
+NATIVE_SCALE = 4
 # Wall-clock guard (s) for ONE invocation of _upscale_video -- decode, upscale AND encode, not per
 # phase despite the historical name: it is stamped once and shared. A run that blows past it aborts and
 # the job degrades (ok:false + detail -> module passthrough) instead of hanging to the platform kill.
@@ -322,6 +331,133 @@ def _parse_res(res):
     return 1280, 720
 
 
+class SizeRequestError(ValueError):
+    """Malformed or unsatisfiable size request. The job path returns ok:false + error so the
+    module passthroughs the original clip instead of billing a wrong-sized ok:true (#102)."""
+
+
+def _as_int(value, name):
+    """Strict integer parse. bool is a subclass of int in Python, so True would otherwise
+    become 1 and silently collapse; refuse it."""
+    if isinstance(value, bool) or value is None:
+        raise SizeRequestError(f"{name} must be an integer, got {value!r}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value != int(value):
+            raise SizeRequestError(f"{name} must be an integer, got {value!r}")
+        return int(value)
+    s = str(value).strip()
+    if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+        return int(s)
+    raise SizeRequestError(f"{name} must be an integer, got {value!r}")
+
+
+def _parse_size_knobs(inp):
+    """Extract (scale, target_height) from a job input.
+
+    `target_height` is the studio contract (vivijure-local local-finish sends 1080 and no
+    scale). `scale`, when sent, must be exactly 2 or 4 -- anything else used to be collapsed
+    (`4 if int(...) >= 4 else 2`) and that is the billed lie #102 closes. Default scale=2
+    only when NEITHER knob is present, so a height-only request is not also a 2x request.
+    """
+    raw_th = inp.get("target_height") if inp else None
+    raw_scale = inp.get("scale") if inp else None
+    th = None
+    if raw_th is not None and raw_th != "":
+        th = _as_int(raw_th, "target_height")
+        if th < 2:
+            raise SizeRequestError(f"target_height must be >= 2, got {th}")
+    scale = None
+    if raw_scale is not None and raw_scale != "":
+        scale = _as_int(raw_scale, "scale")
+        if scale not in ALLOWED_SCALES:
+            raise SizeRequestError(
+                f"scale must be 2 or 4, got {scale} (refusing to collapse it)")
+    if th is None and scale is None:
+        scale = 2
+    return scale, th
+
+
+def _report_scale(out_h, src_h):
+    """The delivered height ratio, as an int when it is a whole number, else a short float.
+    Never the requested knob: a capped 4x that delivered 2.67x must not report scale:4."""
+    ratio = out_h / src_h
+    rounded = round(ratio, 4)
+    if abs(rounded - round(rounded)) < 1e-9:
+        return int(round(rounded))
+    return rounded
+
+
+def _applied_tag(out_h, scale_used, *, from_target_height):
+    """Honest applied tag. A height request is tagged as the delivered height; a scale
+    request is tagged Nx only when that N was actually delivered."""
+    if from_target_height or scale_used not in ALLOWED_SCALES:
+        return f"upscale:{int(out_h)}h"
+    return f"upscale:{int(scale_used)}x"
+
+
+def _resolve_output_size(src_w, src_h, scale=None, target_height=None, max_edge=None):
+    """Single sizing authority. Returns (out_w, out_h, scale_used).
+
+    `target_height` wins when present: deliver that exact even height (aspect-preserved)
+    via the existing GPU interpolate after native 4x. Refuse rather than substitute when
+    the request is a downscale, equals the source, needs more than 4x, or would be
+    changed by MAX_OUTPUT_LONG_EDGE.
+
+    Without `target_height`, `scale` must be 2 or 4. The long-edge cap may shrink a
+    scale-only request; the caller reports the ACTUAL out_w/out_h/scale so a cap is
+    never a silent lie.
+
+    If both knobs are present they must agree (target_height == even(src_h * scale)).
+    """
+    if max_edge is None:
+        max_edge = MAX_LONG_EDGE
+    src_w, src_h = int(src_w), int(src_h)
+    if not (src_w > 0 and src_h > 0):
+        raise SizeRequestError("could not probe source dimensions")
+
+    if target_height is not None:
+        want_h = int(target_height) - (int(target_height) % 2)
+        if want_h < 2:
+            raise SizeRequestError(f"target_height {target_height} is too small")
+        if want_h < src_h:
+            raise SizeRequestError(
+                f"target_height {target_height} is smaller than source height {src_h} "
+                f"(this door upscales; it does not downscale)")
+        if want_h == src_h:
+            raise SizeRequestError(
+                f"target_height {target_height} equals source height {src_h} "
+                f"(nothing to upscale)")
+        max_h = (src_h * NATIVE_SCALE) - ((src_h * NATIVE_SCALE) % 2)
+        if want_h > max_h:
+            raise SizeRequestError(
+                f"target_height {target_height} needs more than {NATIVE_SCALE}x "
+                f"(source {src_h} -> max {max_h})")
+        want_w = int(round(src_w * want_h / src_h))
+        want_w = want_w - (want_w % 2)
+        capped_w, capped_h = _capped(want_w, want_h, max_edge)
+        if (capped_w, capped_h) != (want_w, want_h):
+            raise SizeRequestError(
+                f"target_height {target_height} ({want_w}x{want_h}) exceeds "
+                f"MAX_OUTPUT_LONG_EDGE={max_edge}")
+        if scale is not None:
+            scale_h = (src_h * scale) - ((src_h * scale) % 2)
+            if scale_h != want_h:
+                raise SizeRequestError(
+                    f"target_height {target_height} and scale {scale} disagree "
+                    f"(scale would yield height {scale_h} from source {src_h})")
+        return want_w, want_h, _report_scale(want_h, src_h)
+
+    if scale is None:
+        scale = 2
+    if scale not in ALLOWED_SCALES:
+        raise SizeRequestError(
+            f"scale must be 2 or 4, got {scale} (refusing to collapse it)")
+    out_w, out_h = _capped(src_w * scale, src_h * scale, max_edge)
+    return out_w, out_h, _report_scale(out_h, src_h)
+
+
 def _load_model(name):
     name = name if name in MODEL_FILES else "realesr-animevideov3"
     if name not in _MODELS:
@@ -469,11 +605,14 @@ def _read_exact(stream, n):
     return b"".join(parts)
 
 
-def _upscale_video(model, src, dst, final_scale, budget=None):
+def _upscale_video(model, src, dst, final_scale, budget=None, target_height=None):
     """Decode -> batched GPU upscale + GPU resize -> re-encode, entirely through ffmpeg rawvideo pipes
     (no PNG disk roundtrip). Audio is copied when present. Returns a dict: frames, encoder, out dims,
-    per-phase seconds (decode/upscale/encode), the budget the run was held to, and the batch/fp16
-    settings actually used.
+    the delivered scale, per-phase seconds (decode/upscale/encode), the budget the run was held to,
+    and the batch/fp16 settings actually used.
+
+    `final_scale` is 2, 4, or None (height-only request). `target_height` is the studio contract.
+    Size is resolved AFTER the source probe by `_resolve_output_size` -- the one authority.
 
     ONE deadline covers every step, and it is STAMPED FIRST so the probes are inside it too. Before
     #105 it was stamped after the probes and after the nvenc probe, and it was checked in exactly two
@@ -486,7 +625,8 @@ def _upscale_video(model, src, dst, final_scale, budget=None):
     sw, sh = (int(wh[0]), int(wh[1])) if len(wh) >= 2 else (0, 0)
     if not (sw and sh):
         raise RuntimeError("could not probe source dimensions")
-    out_w, out_h = _capped(sw * final_scale, sh * final_scale, MAX_LONG_EDGE)
+    out_w, out_h, scale_used = _resolve_output_size(
+        sw, sh, scale=final_scale, target_height=target_height)
     encoder = "h264_nvenc" if _nvenc_available() else "libx264"  # bounded at 30s + 60s inside _probe_nvenc
     deadline.check("nvenc-probe")
     fsize = sw * sh * 3
@@ -594,6 +734,7 @@ def _upscale_video(model, src, dst, final_scale, budget=None):
         "frames": len(outputs),
         "encoder": encoder,
         "out_w": out_w, "out_h": out_h,
+        "scale": scale_used,
         "extract_s": round(t1 - t0, 2),
         "upscale_s": round(t2 - t1, 2),
         "encode_s": round(t3 - t2, 2),
@@ -685,28 +826,36 @@ def _selftest(inp):
     passed AND the R2 leg did not fail. Trigger with {"selftest": true} (+ optional model / scale / r2,
     plus res "WxH" and dur seconds for the generated test clip -- a large res paired with a large
     UPSCALE_TILE drives the #30 tile-shrink on a small card)."""
-    final_scale = 4 if int(inp.get("scale", 2) or 2) >= 4 else 2
+    try:
+        final_scale, target_height = _parse_size_knobs(inp)
+    except SizeRequestError as e:
+        return {"ok": False, "selftest": True, "error": str(e)}
     r2_requested = bool(inp.get("r2"))
     res, dur = str(inp.get("res", "1280x720")), inp.get("dur", 3)
     requested = inp.get("model")
     if requested:
-        result = _selftest_one(str(requested), final_scale, res, dur)
+        result = _selftest_one(str(requested), final_scale, res, dur, target_height=target_height)
         if r2_requested:
-            r2 = _selftest_r2(final_scale, str(requested), requested=True)
+            r2 = _selftest_r2(final_scale, str(requested), requested=True, target_height=target_height)
             result["r2"] = r2
             result["ok"] = bool(result.get("ok")) and r2.get("ok") is not False
         return result
     names = list(MODEL_FILES.keys())
-    models = {n: _selftest_one(n, final_scale, res, dur) for n in names}
+    models = {n: _selftest_one(n, final_scale, res, dur, target_height=target_height) for n in names}
     # R2 leg uses the fast model (the round-trip proves the boto3 path, not model weight; the sweep above
     # already exercises the heavy x4plus on silicon).
-    r2 = _selftest_r2(final_scale, names[0], requested=r2_requested)
+    r2 = _selftest_r2(final_scale, names[0], requested=r2_requested, target_height=target_height)
     ok = all(m.get("ok") for m in models.values()) and r2.get("ok") is not False  # None (skipped) passes
-    return {"ok": ok, "selftest": True, "swept": names, "scale": final_scale,
-            "cuda_available": torch.cuda.is_available(), "models": models, "r2": r2}
+    out = {"ok": ok, "selftest": True, "swept": names,
+           "cuda_available": torch.cuda.is_available(), "models": models, "r2": r2}
+    if final_scale is not None:
+        out["scale"] = final_scale
+    if target_height is not None:
+        out["target_height"] = target_height
+    return out
 
 
-def _selftest_one(model_name, final_scale, res="1280x720", dur=3):
+def _selftest_one(model_name, final_scale, res="1280x720", dur=3, target_height=None):
     """End-to-end GPU selftest for ONE model at a target scale (NO R2). Loads the model, generates a real
     multi-second clip at `res` (WxH) for `dur` seconds, upscales it, and reports the encoder used, per-phase
     wall-clock, sampled GPU/encoder utilization + peak VRAM, the batch/fp16 settings, and the tile the run
@@ -739,7 +888,7 @@ def _selftest_one(model_name, final_scale, res="1280x720", dur=3):
         out["input_res"] = "x".join(_ffprobe(src, "stream=width,height"))
         sampler.start()
         t0 = time.monotonic()
-        info = _upscale_video(model, src, dst, final_scale)
+        info = _upscale_video(model, src, dst, final_scale, target_height=target_height)
         out["wall_s"] = round(time.monotonic() - t0, 2)
         sampler.stop()
         sampler.join(timeout=2)
@@ -759,7 +908,8 @@ def _selftest_one(model_name, final_scale, res="1280x720", dur=3):
             out["peak_vram_mib"] = round(torch.cuda.max_memory_allocated() / (1024 * 1024), 1)
         out["output_res"] = "x".join(_ffprobe(dst, "stream=width,height"))
         out["output_bytes"] = os.path.getsize(dst)
-        out["scale"] = final_scale
+        out["scale"] = info["scale"]
+        out["out_w"], out["out_h"] = info["out_w"], info["out_h"]
         out["ok"] = True
         return out
     except InvocationExpired as e:  # BaseException-derived: the broad handler below cannot see it
@@ -876,7 +1026,10 @@ def _upscale_r2(inp):
     err = _scoped_key_error(output_key, "output_key", project=project)
     if err:
         return {"ok": False, "error": err}
-    final_scale = 4 if int(inp.get("scale", 2) or 2) >= 4 else 2
+    try:
+        final_scale, target_height = _parse_size_knobs(inp)
+    except SizeRequestError as e:
+        return {"ok": False, "error": str(e)}
     model_name = str(inp.get("model", "realesr-animevideov3"))
     if not (R2_ENDPOINT and os.environ.get("R2_ACCESS_KEY_ID")):
         return {"ok": False, "error": "R2 mode needs R2_ENDPOINT_URL + R2_ACCESS_KEY_ID/SECRET in the endpoint env"}
@@ -886,14 +1039,17 @@ def _upscale_r2(inp):
         s3 = _r2()
         s3.download_file(R2_BUCKET, clip_key, src)
         model = _load_model(model_name)
-        info = _upscale_video(model, src, dst, final_scale)
+        info = _upscale_video(model, src, dst, final_scale, target_height=target_height)
         if not os.path.getsize(dst):
             return {"ok": False, "error": "upscale produced no output"}
         s3.upload_file(dst, R2_BUCKET, output_key, ExtraArgs={"ContentType": "video/mp4"})
         _stamp_sidecar_r2(s3, output_key, inp.get("output_hash"))  # #583: sidecar AFTER the artifact
         return {"ok": True, "clip_key": output_key, "bytes": os.path.getsize(dst),
-                "scale": final_scale, "model": model_name, "frames": info["frames"],
-                "encoder": info["encoder"], "applied": [f"upscale:{final_scale}x"]}
+                "scale": info["scale"], "out_w": info["out_w"], "out_h": info["out_h"],
+                "model": model_name, "frames": info["frames"],
+                "encoder": info["encoder"],
+                "applied": [_applied_tag(info["out_h"], info["scale"],
+                                         from_target_height=target_height is not None)]}
     except InvocationExpired as e:
         # THE SOFT-DEGRADE SHAPE, and both halves of it are load-bearing (#105).
         # RETURN, NEVER RAISE: a raise leaves the RunPod envelope with no structured output, which
@@ -912,7 +1068,7 @@ def _upscale_r2(inp):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _selftest_r2(final_scale, model_name, requested):
+def _selftest_r2(final_scale, model_name, requested, target_height=None):
     """Exercise the REAL _upscale_r2 finish contract (boto3 download + upload against the shared bucket):
     generate a tiny clip, upload it under a temp renders/ key, run _upscale_r2, confirm the output object
     landed, then delete both objects (and the .hash sidecar). HONEST-FAILURES: if R2 creds/env are absent
@@ -943,8 +1099,13 @@ def _selftest_r2(final_scale, model_name, requested):
             leg["error"] = f"ffmpeg gen failed: {(gen.stderr or '')[-300:]}"
             return leg
         s3.upload_file(src, R2_BUCKET, clip_key, ExtraArgs={"ContentType": "video/mp4"})
-        res = _upscale_r2({"project": "_selftest", "clip_key": clip_key, "output_key": output_key,
-                           "scale": final_scale, "model": model_name})
+        r2_job = {"project": "_selftest", "clip_key": clip_key, "output_key": output_key,
+                  "model": model_name}
+        if final_scale is not None:
+            r2_job["scale"] = final_scale
+        if target_height is not None:
+            r2_job["target_height"] = target_height
+        res = _upscale_r2(r2_job)
         if not res.get("ok"):
             # `detail` is the guard's degrade key; without it a guard expiry here reads as an
             # unexplained not-ok and the selftest loses the one fact that mattered.
@@ -981,7 +1142,10 @@ def handler(job):
     output_key = inp.get("output_key", "")
     if not video_url or not output_url:
         return {"ok": False, "error": "input needs presigned video_url + output_url"}
-    final_scale = 4 if int(inp.get("scale", 2) or 2) >= 4 else 2
+    try:
+        final_scale, target_height = _parse_size_knobs(inp)
+    except SizeRequestError as e:
+        return {"ok": False, "error": str(e)}
     model_name = str(inp.get("model", "realesr-animevideov3"))
     work = tempfile.mkdtemp(prefix="up-")
     src, dst = os.path.join(work, "in.mp4"), os.path.join(work, "out.mp4")
@@ -992,7 +1156,7 @@ def handler(job):
                 for chunk in r.iter_content(1 << 20):
                     f.write(chunk)
         model = _load_model(model_name)
-        info = _upscale_video(model, src, dst, final_scale)
+        info = _upscale_video(model, src, dst, final_scale, target_height=target_height)
         size = os.path.getsize(dst)
         if not size:
             return {"ok": False, "error": "upscale produced no output"}
@@ -1002,8 +1166,11 @@ def handler(job):
         put.raise_for_status()
         _stamp_sidecar_presigned(inp.get("hash_url"), inp.get("output_hash"))  # #583: sidecar AFTER the artifact
         return {"ok": True, "output_key": output_key, "bytes": size,
-                "scale": final_scale, "model": model_name, "frames": info["frames"],
-                "encoder": info["encoder"]}
+                "scale": info["scale"], "out_w": info["out_w"], "out_h": info["out_h"],
+                "model": model_name, "frames": info["frames"],
+                "encoder": info["encoder"],
+                "applied": [_applied_tag(info["out_h"], info["scale"],
+                                         from_target_height=target_height is not None)]}
     except InvocationExpired as e:  # same soft-degrade contract as the R2 path above
         return {"ok": False, "detail": str(e)[:120]}
     except Exception as e:  # noqa: BLE001 -- a job error is data, returned to the caller

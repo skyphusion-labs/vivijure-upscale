@@ -8,6 +8,22 @@ file records the why behind each release. Newest first.
 
 ## Unreleased
 
+- **fix(upscale): honour `target_height` and stop collapsing `scale` to 2 or 4 (#102).** The studio
+  (vivijure-local `local-finish/app.ts`) sends `target_height: 1080` and no scale. The handler never
+  read that key. Sizing was one line -- `final_scale = 4 if int(inp.get("scale", 2) or 2) >= 4 else 2`
+  -- so a sized request returned 2x the SOURCE with `ok: true`. Hosted upscale is a billed GPU door;
+  that is silent wrong output we still charge for. It only produced 1080 when the source was exactly
+  540p, the one fixture where honoured and ignored are indistinguishable.
+
+  One function (`_resolve_output_size`) is now the sizing authority. `target_height` delivers that
+  exact even height (aspect-preserved) via the GPU interpolate the pipeline already had after native
+  4x. `scale` is only 2 or 4; any other value is refused, never collapsed. A height that needs more
+  than 4x, a downscale, a no-op (already at the target), or a long-edge cap that would change a
+  requested height returns `ok: false` so the module passthroughs instead of substituting. A
+  scale-only request may still be long-edge-capped (the safety bound stays), but the result reports
+  the actual `out_w` / `out_h` / `scale` and the applied tag is `upscale:<h>h` unless the requested
+  2x/4x was delivered exactly.
+
 - **fix(upscale): bring the ENCODE step inside the invocation deadline, and enforce it ON the child
   processes (#105).** `_upscale_video` stamped one deadline and checked it twice, at decode and at
   upscale. Between `t2` and `t3` -- a raw `subprocess.Popen`, a write loop, and an unbounded
