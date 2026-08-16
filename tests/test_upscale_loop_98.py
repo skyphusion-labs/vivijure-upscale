@@ -1,20 +1,16 @@
-"""upscale#98 -- the abort path leaked the CUDA cache, and the tile search was re-paid per batch.
+"""upscale#98 -- abort-path leak, per-batch tile re-search, and the remaining silent-wrong-output.
 
-Both defects live in `_upscale_video`'s batch loop, so both are driven THROUGH THAT LOOP here rather
-than through a re-statement of it. Heavy deps are stubbed exactly as the sibling tests do (no GPU, no
-ffmpeg), but the control flow under test is the shipped one.
+The first two defects live in `_upscale_video`'s batch loop and shipped in #99. The remaining one
+is the same loop: a long RealESRGAN_x4plus shot burns the whole wall-clock guard, then the job
+path returns ok:false and the module passthroughs, so the film ships un-upscaled. SCENE_MAX_SECONDS
+is 60; the door admits ~10s of 720p x4plus inside a 1200s budget. Raising the budget just hits
+PHASE_HARD_DEADLINE_SECONDS (5400) instead.
 
-The two findings and why they are one issue:
+The honest leftover: after the first settled batch, project remaining work against the remaining
+budget and refuse NOW with InvocationExpired. Same {ok:false, detail} the module already treats
+as degrade. Never ok:true at the source resolution -- that is the billed lie (#102's sibling).
 
-1. `torch.cuda.empty_cache()` sat AFTER the loop with no `finally`, so `raise TimeoutError` jumped
-   over it and the allocator kept its reservation for the life of the process. MEASURED on fatmike:
-   ~19.7 GiB of a 20475 MiB card still held while the container sat idle with the job long finished,
-   against ~2 GiB after a job that COMPLETED. The leak is a property of the ABORT path, not of torch
-   and not of the model, so the two halves of #98 are one defect: the timeout causes the leak.
-
-2. `_upscale_batch` restarted its OOM-shrink search from `TILE` on every batch, and the settled tile
-   was captured only for reporting. On x4plus at 720p the tile settles 512 -> 256, so every batch
-   re-ran a forward pass already known to OOM, caught it, emptied the cache and retried.
+Heavy deps are stubbed (no GPU, no ffmpeg). The control flow under test is the shipped one.
 """
 import contextlib
 import os
@@ -115,15 +111,24 @@ class _Enc:
 
 def _wire(handler, monkeypatch, *, nframes, batch_tiles, w=8, h=8, batch_sleep_s=0.0, read_sleep_s=0.0):
     """Point _upscale_video at fakes. `batch_tiles` is the tile each successive batch will SETTLE on,
-    so a test can make the first batch shrink and then assert what the second batch was HANDED."""
+    so a test can make the first batch shrink and then assert what the second batch was HANDED.
+
+    `batch_sleep_s` may be a float (every batch) or a sequence (per batch, last value sticks).
+    The projection tests need the first batch slower than the rest -- that is the OOM-search
+    shape -- and a single sleep cannot tell a working projection from one that used the
+    search-inflated rate and refused a job that would have finished.
+    """
     seen_start_tiles = []
     settled = list(batch_tiles)
+    sleeps = list(batch_sleep_s) if isinstance(batch_sleep_s, (list, tuple)) else None
 
     def fake_upscale_batch(model, frames_np, out_w, out_h, start_tile=None):
         seen_start_tiles.append(start_tile)
-        if batch_sleep_s:
-            time.sleep(batch_sleep_s)  # push real monotonic time past the deadline inside the LOOP
-        tile = settled[min(len(seen_start_tiles) - 1, len(settled) - 1)]
+        idx = len(seen_start_tiles) - 1
+        sleep = sleeps[min(idx, len(sleeps) - 1)] if sleeps is not None else batch_sleep_s
+        if sleep:
+            time.sleep(sleep)  # push real monotonic time past the deadline inside the LOOP
+        tile = settled[min(idx, len(settled) - 1)]
         return [b"o" for _ in frames_np], tile
 
     def fake_popen(cmd, **kw):
@@ -232,3 +237,99 @@ def test_the_carried_tile_is_clamped_into_the_configured_range():
     assert handler._clamped_start_tile(4096) == 512   # never wider than the ceiling
     assert handler._clamped_start_tile(1) == 64       # never below the floor
     assert handler._clamped_start_tile(64) == 64      # the floor itself is admissible
+
+
+# ---- the remaining half of #98: project and refuse, never ok:true at the source res ---------------
+
+def test_project_does_not_fire_when_the_work_fits():
+    """CONTROL for the method. Without this, a project() that always raises still greens every
+    'it refused' test below."""
+    handler, _ = _load_handler()
+    handler._Deadline(1200).project("upscale", 1.0, 16)
+
+
+def test_the_projection_reason_fits_the_120_characters_that_survive():
+    """Same 120-char cap as check() (vivijure-cf degradeReason). A projected refuse that loses
+    'projected' to truncation is indistinguishable from a regular timeout."""
+    handler, _ = _load_handler()
+    with pytest.raises(handler.InvocationExpired) as e:
+        handler._Deadline(1200).project("upscale", 5000, 1440)
+    assert len(str(e.value)) <= 120, str(e.value)
+    assert "projected" in str(e.value), str(e.value)
+    assert str(e.value).startswith("upscale-invocation-guard: upscale projected "), str(e.value)
+
+
+def test_a_job_that_cannot_finish_is_refused_after_the_settled_batch_not_at_the_budget(monkeypatch):
+    """THE HEADLINE. Ten batches, each 0.35s, budget 3s. A regular deadline.check fires at 3s
+    after ~8 batches. A working projection fires after batch 1 (tile already settled at TILE,
+    so that batch IS the rate) and before batch 2 burns the rest of the card.
+
+    Elapsed MUST be asserted. InvocationExpired arrives either way -- 3s later if project()
+    is deleted -- and that is the same trap #105's encode test exists for.
+    """
+    handler, calls = _load_handler({"UPSCALE_BATCH": 2, "UPSCALE_TILE": 512})
+    _wire(handler, monkeypatch, nframes=20, batch_tiles=[512], batch_sleep_s=0.35)
+    t0 = time.monotonic()
+    with pytest.raises(handler.InvocationExpired) as e:
+        handler._upscale_video(object(), "in.mp4", "out.mp4", 2, budget=3)
+    elapsed = time.monotonic() - t0
+    assert "projected" in str(e.value), f"wrong branch (regular timeout?): {e.value}"
+    assert elapsed < 1.2, f"burned the budget instead of projecting: {elapsed:.2f}s"
+    assert elapsed >= 0.30, f"refused before a settled batch existed: {elapsed:.2f}s"
+    assert calls["empty_cache"] == 1, "projection is an abort path; it must release too"
+
+
+def test_a_first_batch_that_shrank_must_not_project_the_search_rate(monkeypatch):
+    """x4plus at 720p settles 512 -> 256 on batch 1. That batch's seconds-per-frame includes
+    a forward pass known to OOM. Projecting from it refuses shots the remaining batches would
+    have finished (the 7s films in our own render history).
+
+    First batch 1.4s (search), then 0.08s. Budget 3s. Search-rate projection after batch 1:
+    1.4/2 = 0.7s/frame * 8 left = 5.6s > ~1.6s remaining -> refuse. Settled-rate projection
+    after batch 2: 0.08/2 = 0.04s/frame * 6 left = 0.24s < remaining -> admit. Completes.
+    """
+    handler, _ = _load_handler({"UPSCALE_BATCH": 2, "UPSCALE_TILE": 512})
+    seen = _wire(handler, monkeypatch, nframes=10, batch_tiles=[256, 256, 256, 256, 256],
+                 batch_sleep_s=[1.4, 0.08])
+    t0 = time.monotonic()
+    info = handler._upscale_video(object(), "in.mp4", "out.mp4", 2, budget=3)
+    elapsed = time.monotonic() - t0
+    assert info["frames"] == 10, info
+    assert seen == [None, 256, 256, 256, 256], seen
+    assert elapsed < 2.4, f"should have completed on the settled rate: {elapsed:.2f}s"
+
+
+def test_a_job_that_cannot_finish_returns_ok_false_and_never_uploads(monkeypatch):
+    """The job-path shape. A long shot must not come back as ok:true (with or without a
+    scale / out_h that claims the upscale happened). detail, not error: error is lifted
+    into a FAILED envelope and books a failed job row for an honest degrade.
+    """
+    handler, _ = _load_handler({
+        "UPSCALE_BATCH": 2, "UPSCALE_TILE": 512,
+        "R2_ENDPOINT_URL": "https://r2.invalid",
+        "R2_ACCESS_KEY_ID": "test",
+        "R2_SECRET_ACCESS_KEY": "test",
+    })
+    _wire(handler, monkeypatch, nframes=20, batch_tiles=[512], batch_sleep_s=0.35)
+    monkeypatch.setattr(handler, "_invocation_budget", lambda: 3)
+    uploaded = []
+    monkeypatch.setattr(handler, "_r2", lambda: types.SimpleNamespace(
+        download_file=lambda *a, **k: None,
+        upload_file=lambda *a, **k: uploaded.append(True),
+        put_object=lambda *a, **k: None,
+    ))
+    monkeypatch.setattr(handler, "_load_model", lambda name: object())
+    out = handler._upscale_r2({
+        "project": "p",
+        "clip_key": "renders/p/clips/s.mp4",
+        "output_key": "renders/p/clips/s_up.mp4",
+        "model": "RealESRGAN_x4plus",
+        "scale": 2,
+    })
+    assert out["ok"] is False, out
+    assert "error" not in out, out
+    assert "projected" in out.get("detail", ""), out
+    assert len(out["detail"]) <= 120
+    assert uploaded == [], "must not upload a partial or source-resolution artifact"
+    assert "scale" not in out and "out_h" not in out, out
+    assert "applied" not in out, out
