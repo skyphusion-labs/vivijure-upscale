@@ -8,6 +8,13 @@ file records the why behind each release. Newest first.
 
 ## Unreleased
 
+## v1.1.4 -- 2026-08-16
+
+A long `RealESRGAN_x4plus` shot no longer burns the whole guard and ships the
+source as a successful film. Pin serve to `1.1.4-serve` after the bake if you
+want this on the twins; 1.1.3 still honours `target_height` and is otherwise
+the live pin.
+
 - **fix(upscale): refuse a job that cannot finish inside the budget, instead of burning the
   guard and shipping the source (#98).** #99 released the abort-path leak and stopped
   re-searching the tile; #105 made a timeout return `{ok: false, detail}` so the module
