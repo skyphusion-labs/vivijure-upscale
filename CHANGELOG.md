@@ -8,6 +8,14 @@ file records the why behind each release. Newest first.
 
 ## Unreleased
 
+## v1.1.3 -- 2026-08-16
+
+The live serve pin (`1.1.1-serve`) still ignored `target_height` and
+collapsed every scale to 2 or 4. This tag is the first image that honours
+the studio height contract (#109) and that caps the encode inside the
+invocation deadline (#107). Pin serve to `1.1.3-serve` after the bake;
+do not leave twins on 1.1.1.
+
 - **fix(upscale): honour `target_height` and stop collapsing `scale` to 2 or 4 (#102).** The studio
   (vivijure-local `local-finish/app.ts`) sends `target_height: 1080` and no scale. The handler never
   read that key. Sizing was one line -- `final_scale = 4 if int(inp.get("scale", 2) or 2) >= 4 else 2`
