@@ -177,7 +177,7 @@ def test_single_model_without_r2_flag_never_touches_the_bucket(monkeypatch):
 def test_res_and_dur_thread_to_selftest_one(monkeypatch):
     seen = []
     monkeypatch.setattr(handler, "_selftest_one",
-                        lambda name, scale, res="1280x720", dur=3: seen.append((name, scale, res, dur))
+                        lambda name, scale, res="1280x720", dur=3, **k: seen.append((name, scale, res, dur))
                         or {"ok": True})
     monkeypatch.setattr(handler, "_selftest_r2", lambda *a, **k: {"ok": None, "skipped": "no creds"})
     handler._selftest({"selftest": True, "scale": 4, "res": "2560x1440", "dur": 1})

@@ -118,16 +118,18 @@ Every setting is in `deploy.env`, and each one is explained in full (what it is,
 | `CONTAINER_REGISTRY_AUTH_ID` | RunPod credential id, only if your image is private. |
 | `R2_ENDPOINT_URL` / `R2_BUCKET` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 keys for the studio's finish-chain mode (the endpoint reads/writes your bucket by key). |
 
-Two per-job knobs the studio can pass: **`scale`** (default 2; `2` or `4`) and **`model`** (default
-`realesr-animevideov3`, fast and great for animation; `RealESRGAN_x4plus` is a general-purpose 4x).
+Three per-job knobs the studio can pass: **`target_height`** (exact output height in px; the studio
+sends `1080`), **`scale`** (default 2 when neither knob is set; `2` or `4` only -- anything else is
+refused, never collapsed), and **`model`** (default `realesr-animevideov3`, fast and great for
+animation; `RealESRGAN_x4plus` is a general-purpose 4x).
 
 ## The job contract
 
 Three modes, so you know exactly what the endpoint does.
 
-- **R2 finish-chain mode:** `{ "clip_key": "...", "output_key": "...", "scale": 2,
+- **R2 finish-chain mode:** `{ "clip_key": "...", "output_key": "...", "target_height": 1080,
   "model": "realesr-animevideov3" }`.
-- **Presigned mode:** `{ "video_url": "...", "output_url": "...", "output_key": "...", "scale": 2 }`.
+- **Presigned mode:** `{ "video_url": "...", "output_url": "...", "output_key": "...", "target_height": 1080 }`.
 - **Self-test:** `{ "selftest": true, "scale": 2 }` upscales a generated clip end to end and reports
   the encoder used, GPU use, and timing, so you can prove a fresh endpoint is GPU-bound. With no `model`
   it SWEEPS every shipped model (so a heavy model like `RealESRGAN_x4plus` is verified on the real GPU,

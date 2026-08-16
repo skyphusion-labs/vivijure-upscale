@@ -34,16 +34,20 @@ do not freeze a single version here as current forever.
 One typed in / one typed out, three dispatch modes (`handler(job)` branches on the input keys):
 
 - **R2 finish-chain mode** (the endpoint reads/writes the shared bucket itself, no creds on the wire):
-  `{ clip_key, output_key?, scale?, model? }`. Returns the new key as `clip_key` so the finish chain
-  carries the upscaled clip downstream, with `applied:["upscale:<n>x"]`.
-- **Presigned mode** (credentialless: the caller presigns R2): `{ video_url, output_url, output_key, scale?, model? }`.
+  `{ clip_key, output_key?, target_height?, scale?, model? }`. Returns the new key as `clip_key` so the
+  finish chain carries the upscaled clip downstream, with `applied:["upscale:<n>x"]` or
+  `applied:["upscale:<h>h"]` when a height was requested. Also reports `out_w` / `out_h`.
+- **Presigned mode** (credentialless: the caller presigns R2): `{ video_url, output_url, output_key, target_height?, scale?, model? }`.
 - **Selftest:** `{ "selftest": true, "scale"? }` generates a real 720p24x3s clip, upscales it end to
   end, and PROVES the result is GPU-bound: it reports the actual `encoder` + `nvenc_used`, the per-phase
   wall-clock split (`phase_s`), sampled GPU/encoder util (`gpu_sample`), `peak_vram_mib`, and
   `batch`/`fp16`. Doubles as the endpoint health check.
 
-`scale` is `2` or `4` (the models are 4x native; a 2x is the 4x inference GPU-downscaled /2, no CPU
-Lanczos). `model` is `realesr-animevideov3` (anime/fast, default) or `RealESRGAN_x4plus` (general).
+`target_height` is the studio contract (exact output height; 4x inference then GPU interpolate).
+`scale` is `2` or `4` only (the models are 4x native; a 2x is the 4x inference GPU-downscaled /2, no
+CPU Lanczos). A value that is not 2 or 4 is refused, never collapsed. An unsatisfiable height
+(beyond 4x, a downscale, a no-op, a long-edge cap that would change the request) is `ok: false`.
+`model` is `realesr-animevideov3` (anime/fast, default) or `RealESRGAN_x4plus` (general).
 **A non-ok result is a soft-degrade signal** the module honors by passing the original clip through,
 never a drop.
 
