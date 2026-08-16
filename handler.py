@@ -47,7 +47,10 @@ THE WALL-CLOCK GUARD covers the WHOLE of _upscale_video: probe, nvenc probe, dec
 and the wait() on both children. It is enforced ON the child processes (a watchdog that kills them),
 not only by checks between steps, because a write to a full pipe and a wait() on a stalled child both
 block in the kernel where the next check is never reached. Its budget is _invocation_budget(), which
-sits UNDER the platform execution ceiling rather than above it -- see that function.
+sits UNDER the platform execution ceiling rather than above it -- see that function. After the first
+settled GPU batch the loop also PROJECTS remaining work against whatever is left of that budget and
+refuses immediately if it cannot finish (#98): burning the rest of the guard then degrading is the
+same un-upscaled film, just later.
 """
 
 import os
@@ -208,6 +211,25 @@ class _Deadline:
     def check(self, step):
         if self.expired():
             raise InvocationExpired(self.reason(step))
+
+    def project(self, step, need, frames_left):
+        """Refuse NOW if `need` seconds of remaining work will miss the budget (#98).
+
+        Named apart from check() because check() is about the clock already having
+        expired, and this is about the clock being about to. The reason has to say
+        `projected`, or a test that only looks for InvocationExpired cannot tell a
+        working projection from a regular timeout that arrived later.
+
+        Same envelope as check(): InvocationExpired -> job path returns
+        {ok: false, detail: ...}, which the module already treats as degrade.
+        Never ok:true at the source resolution -- that is the billed lie.
+        """
+        left = self.remaining()
+        if need > left:
+            raise InvocationExpired(
+                f"{self.label}: {step} projected {need:.0f}s > {left:.0f}s left "
+                f"({int(frames_left)} frames)"[:120]
+            )
 
 
 @contextlib.contextmanager
@@ -662,12 +684,29 @@ def _upscale_video(model, src, dst, final_scale, budget=None, target_height=None
     outputs = []
     tile_min = TILE  # smallest tile any batch settled on; < TILE means the shrink fallback fired (#30)
     next_tile = None  # carry the settled tile into the next batch instead of re-searching from TILE (#98)
+    sec_per_frame = None  # settled rate; None until a batch completes without paying an OOM-search
     try:
         for i in range(0, len(inputs), BATCH):
+            # After the first settled batch we know this card's rate. Project the REST of the
+            # job against the remaining budget and refuse now if it cannot finish (#98).
+            # Burning the whole guard then degrading is the same un-upscaled film, just later
+            # and more expensive; silent ok:true at the source resolution is the lie.
+            if sec_per_frame is not None:
+                frames_left = len(inputs) - i
+                deadline.project("upscale", sec_per_frame * frames_left, frames_left)
             chunk = inputs[i:i + BATCH]
             frames_np = [np.frombuffer(b, dtype=np.uint8).reshape(sh, sw, 3) for b in chunk]
+            t_b0 = time.monotonic()
             outs, tile_used = _upscale_batch(model, frames_np, out_w, out_h, start_tile=next_tile)
+            batch_s = time.monotonic() - t_b0
             tile_min = min(tile_min, tile_used)
+            # A batch that shrank paid an OOM-search; its seconds-per-frame is not the
+            # settled rate and must not project the rest of the job (it would refuse
+            # shots the remaining batches would have finished). x4plus at 720p settles
+            # 512 -> 256 on the first batch; the second batch is the rate.
+            start_for_this = TILE if next_tile is None else next_tile
+            if tile_used >= start_for_this:
+                sec_per_frame = batch_s / max(len(chunk), 1)
             next_tile = tile_used
             outputs.extend(np.ascontiguousarray(f).tobytes() for f in outs)
             for j in range(i, min(i + BATCH, len(inputs))):

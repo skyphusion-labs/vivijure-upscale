@@ -8,6 +8,21 @@ file records the why behind each release. Newest first.
 
 ## Unreleased
 
+- **fix(upscale): refuse a job that cannot finish inside the budget, instead of burning the
+  guard and shipping the source (#98).** #99 released the abort-path leak and stopped
+  re-searching the tile; #105 made a timeout return `{ok: false, detail}` so the module
+  degrades. What stayed: `RealESRGAN_x4plus` on a shot past ~10s of 720p still spent the
+  whole 1200s (serve) / 570s (serverless) guard, then the module passthrough'd and the
+  film shipped un-upscaled. `SCENE_MAX_SECONDS` is 60. Raising the guard just meets
+  `PHASE_HARD_DEADLINE_SECONDS` (5400) instead.
+
+  After the first batch that did not pay an OOM-search, the loop now projects
+  `settled_seconds_per_frame * frames_left` against the remaining budget and raises
+  `InvocationExpired` immediately. Same envelope the module already treats as degrade.
+  A first batch that shrank (x4plus 512 -> 256) is not the rate -- projecting from it
+  would refuse shots the remaining batches would have finished. Never `ok: true` at the
+  source resolution; never an upload of a partial artifact.
+
 ## v1.1.3 -- 2026-08-16
 
 The live serve pin (`1.1.1-serve`) still ignored `target_height` and

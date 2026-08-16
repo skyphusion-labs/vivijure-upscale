@@ -94,7 +94,10 @@ you set them). The defaults are good for most cards.
   encode and memory sane no matter the source. Example: `MAX_OUTPUT_LONG_EDGE=3840`.
 - **`FFMPEG_TIMEOUT`** (default `1200`) -- the wall-clock guard for one upscale, in seconds, covering
   probe, decode, GPU upscale and encode together (not per step, despite the name). Why: a pathological
-  clip degrades (passes the original through) instead of hanging. Example: `FFMPEG_TIMEOUT=1200`.
+  clip degrades (passes the original through) instead of hanging. After the first settled GPU batch
+  the handler also *projects* remaining work against whatever is left of this budget and refuses
+  immediately if it cannot finish (#98), so a long `RealESRGAN_x4plus` shot does not burn the whole
+  guard only to ship the source. Example: `FFMPEG_TIMEOUT=1200`.
 - **`UPSCALE_PLATFORM_TIMEOUT`** (default `600`) -- what the container believes the PLATFORM will kill a
   job at, in seconds; `0` means nothing will. You do not normally set this: `deploy.sh` derives it from
   `EXECUTION_TIMEOUT_MS`, and the homelab serve image pins it to `0`. The guard runs at
