@@ -227,10 +227,35 @@ def token_error(headers_token: str | None, expected: str) -> tuple[int, dict] | 
 MAX_HTTP_BODY_BYTES = 1_048_576  # 1 MiB cap on POST /run (K3: memory DoS)
 
 
+class _BodyRejected:
+    """A request body refused before use, kept DISTINCT from an absent body.
+
+    #106: _body() answered None for three different situations (no body at all, a body
+    past the cap, and a body that would not parse), and the /run branch then did
+    (body or {}).get("input", body or {}), so all three became an EMPTY job accepted with
+    200 and a job id. The caller got a success shape for a request that was never honoured,
+    and the job failed later complaining about a missing key rather than about its body.
+
+    The memory-DoS half of the cap always worked, since an oversize body is never read into
+    memory (_body returns before rfile.read), and that is exactly why the semantics half
+    went unnoticed. Ported from vivijure-blender (fc#1592).
+    """
+
+    __slots__ = ("code", "message")
+
+    def __init__(self, code: int, message: str) -> None:
+        self.code = code
+        self.message = message
+
+
+BODY_TOO_LARGE = _BodyRejected(413, "request body exceeds %d bytes" % MAX_HTTP_BODY_BYTES)
+BODY_INVALID = _BodyRejected(400, "request body is not valid JSON")
+
+
 def route(
     method: str,
     path: str,
-    body: dict | None,
+    body: dict | None | _BodyRejected,
     *,
     registry: JobRegistry,
     token: str | None,
@@ -245,6 +270,11 @@ def route(
         err = token_error(token, expected_token)
         if err:
             return err
+        # Refuse a rejected body instead of silently running an EMPTY job (#106).
+        # AFTER the auth check on purpose: an unauthenticated caller still gets 401 and
+        # learns nothing about the cap, preserving the vivijure-musetalk#93 ordering.
+        if isinstance(body, _BodyRejected):
+            return body.code, {"ok": False, "error": body.message}
         payload = (body or {}).get("input", body or {})
         # #88 / fc#1592: selftest is FORWARDED to the wrapped handler like any other job, never
         # intercepted here. `handler._selftest` is the documented deploy-verification GPU check --
@@ -316,19 +346,19 @@ def run_serve(
             h = self.headers.get("authorization") or ""
             return h[7:] if h.lower().startswith("bearer ") else None
 
-        def _body(self) -> dict | None:
+        def _body(self) -> dict | None | _BodyRejected:
             try:
                 length = int(self.headers.get("content-length") or 0)
             except (TypeError, ValueError):
-                return None
+                return BODY_INVALID
             if length < 0 or length > MAX_HTTP_BODY_BYTES:
-                return None
+                return BODY_TOO_LARGE
             if not length:
                 return None
             try:
                 return json.loads(self.rfile.read(length) or b"{}")
             except Exception:
-                return None
+                return BODY_INVALID
 
         def _dispatch(self, method: str) -> None:
             status, payload = route(

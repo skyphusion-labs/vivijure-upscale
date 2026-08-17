@@ -133,3 +133,52 @@ def test_status_of_an_unknown_job_is_404():
     status, _body = rhs.route("GET", "/status/deadbeefdeadbeef", None, registry=reg,
                               token=TOKEN, expected_token=TOKEN, service=SERVICE)
     assert status == 404
+
+
+# ---- #106: rejected body is not an empty job ------------------------------------------------------
+
+def test_oversize_sentinel_is_413_and_does_not_submit():
+    """route() used to collapse BODY_TOO_LARGE into (body or {}), i.e. an empty job."""
+    reg, seen = _recording_registry()
+    status, body = _post_run(reg, rhs.BODY_TOO_LARGE)
+    assert status == 413, f"oversize sentinel accepted as a job: {status} {body}"
+    assert body.get("ok") is False
+    assert "exceeds" in body.get("error", "")
+    time.sleep(0.05)
+    assert seen == [], f"oversize sentinel was submitted: {seen}"
+
+
+def test_invalid_sentinel_is_400_and_does_not_submit():
+    reg, seen = _recording_registry()
+    status, body = _post_run(reg, rhs.BODY_INVALID)
+    assert status == 400, f"invalid sentinel accepted as a job: {status} {body}"
+    assert body.get("ok") is False
+    assert "not valid JSON" in body.get("error", "")
+    time.sleep(0.05)
+    assert seen == [], f"invalid sentinel was submitted: {seen}"
+
+
+def test_oversize_sentinel_without_a_token_is_401_not_413():
+    """Auth first: an unauthenticated caller must not learn the cap (musetalk#93 ordering)."""
+    reg, seen = _recording_registry()
+    status, body = _post_run(reg, rhs.BODY_TOO_LARGE, token=None)
+    assert status == 401, f"unauthenticated oversize disclosed the cap: {status} {body}"
+    assert body.get("error") == "unauthorized"
+    assert seen == []
+
+
+def test_invalid_sentinel_without_a_token_is_401_not_400():
+    reg, seen = _recording_registry()
+    status, body = _post_run(reg, rhs.BODY_INVALID, token=None)
+    assert status == 401, f"unauthenticated invalid body skipped auth: {status} {body}"
+    assert seen == []
+
+
+def test_absent_body_is_still_accepted_as_an_empty_job():
+    """Control: None (no body) must stay distinct from a rejected body."""
+    reg, seen = _recording_registry()
+    status, body = _post_run(reg, None)
+    assert status == 200 and "id" in body
+    job = _drain(reg, body["id"])
+    assert job is not None and job.status is rhs.JobStatus.COMPLETED
+    assert seen == [{}], seen
