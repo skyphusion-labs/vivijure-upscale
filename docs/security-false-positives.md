@@ -2,17 +2,16 @@
 
 Documented dismissals for adversarial-audit (K2.7/K3) findings that are not actionable bugs in this repo's threat model.
 
-## Presigned mode SSRF (video_url / hash_url)
+## Homelab presigned mode
 
-**Finding:** Presigned homelab mode fetches job-supplied URLs without SSRF guard.
-
-**Disposition:** False positive (operator homelab mode). Presigned mode is an explicit operator-controlled deployment path for homelab R2 bypass; prod finish uses R2 mode with bucket-scoped credentials and host suffix pins (same disposition as vivijure-musetalk #69/#73 and vivijure-audio-upscale).
-
-**Evidence:** `handler.py` presigned branch; prod RunPod template uses R2 mode, not presigned URLs from untrusted submitters.
+When `R2_URL_HOST_SUFFIX` is unset, presigned GET/PUT still refuse non-https, localhost, and
+private / loopback / link-local / metadata addresses, and connect to the validated IP with
+redirects off. The suffix pin is the remaining operator knob: empty default is homelab
+convenience (any public https host). Production RunPod templates set the suffix.
 
 ## Record
 
 | Date | Audit | Finding | Rationale |
 | --- | --- | --- | --- |
-| 2026-07-23 | K3 verify ~18:04 | Presigned video_url SSRF | Operator homelab mode; prod uses R2 mode |
+| 2026-07-23 | K3 verify ~18:04 | Presigned video_url SSRF | Closed: `_url_error` + `_pinned_https` (https, blocked addrs, optional suffix, no redirects) |
 | 2026-07-23 | K3 verify ~18:04 | Unbounded in-memory decode memory DoS | GPU worker bounded by clip duration cap + operator job limits |

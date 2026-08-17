@@ -366,15 +366,33 @@ def test_the_presigned_job_path_returns_the_same_degrade_shape(monkeypatch):
     def raiser(*a, **k):
         raise handler.InvocationExpired("upscale-invocation-guard: decode exceeded 570s budget (elapsed 571.0s)")
 
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, n):
+            return [b"x"]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+    def fake_pin(method, url, **k):
+        return _Resp()
+
     monkeypatch.setattr(handler, "_load_model", lambda name: object())
     monkeypatch.setattr(handler, "_upscale_video", raiser)
-    monkeypatch.setattr(handler.requests, "get", lambda *a, **k: (_ for _ in ()).throw(AssertionError("unreached")),
-                        raising=False)
-    out = handler.handler({"input": {"video_url": "u", "output_url": "o", "download": False}})
+    monkeypatch.setattr(handler, "_url_error", lambda *a, **k: None)
+    monkeypatch.setattr(handler, "_pinned_https", fake_pin)
+    out = handler.handler({"input": {
+        "video_url": "https://bucket.example/v",
+        "output_url": "https://bucket.example/o",
+    }})
     assert out["ok"] is False
-    # The download is stubbed to blow up, so reaching the degrade shape at all proves the guard route,
-    # not the download route.
-    assert "detail" in out or "error" in out
+    assert "detail" in out
+    assert "error" not in out
 
 
 def test_the_selftest_reports_a_guard_expiry_instead_of_escaping(monkeypatch):

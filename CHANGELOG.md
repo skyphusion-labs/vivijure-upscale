@@ -8,6 +8,14 @@ file records the why behind each release. Newest first.
 
 ## Unreleased
 
+- **fix(security): SSRF-gate presigned GET/PUT and redact query strings in errors.** Presigned
+  `video_url` / `output_url` / `hash_url` now follow the musetalk / audio-upscale guard: https
+  only, no localhost, DNS-resolve and refuse private / loopback / link-local / metadata
+  addresses, optional `R2_URL_HOST_SUFFIX` pin when set, and connect to the validated IP with
+  `allow_redirects=False` so a 30x cannot bounce onto another host. Exception text returned
+  to the caller has query strings stripped (`?[redacted]`) so an X-Amz presign never leaves
+  the worker. Guarded by `tests/test_url_validation.py`.
+
 ## v1.1.4 -- 2026-08-16
 
 A long `RealESRGAN_x4plus` shot no longer burns the whole guard and ships the
