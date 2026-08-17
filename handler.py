@@ -63,11 +63,15 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import contextlib
+import ipaddress
+import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
 import time
+from urllib.parse import urlparse, urlunparse
 
 import boto3
 import numpy as np
@@ -967,6 +971,106 @@ def _selftest_one(model_name, final_scale, res="1280x720", dur=3, target_height=
 # The module sends clip_key/output_key and the endpoint reads/writes the shared bucket itself (mirrors
 # vivijure-backend's finish path), so no presigned URLs or R2 creds cross the module wire.
 R2_ENDPOINT = os.environ.get("R2_ENDPOINT_URL", "")
+# Optional pin for presigned hosts (e.g. ".r2.cloudflarestorage.com"). Empty = skip host-suffix check.
+R2_URL_HOST_SUFFIX = os.environ.get("R2_URL_HOST_SUFFIX", "").strip().lower()
+
+# requests / urllib3 exception text embeds the full URL, including the presigned query.
+_FULL_URL_QUERY_RE = re.compile(r"(https?://[^\s'\"<>]+)\?[^\s'\"<>]*", re.IGNORECASE)
+_LABELED_URL_QUERY_RE = re.compile(r"(url:\s+\S+?)\?[^\s'\"<>]*", re.IGNORECASE)
+
+
+def _redact_query(text):
+    """Strip query strings so presigned tokens never leave the worker in errors or logs."""
+    if not text:
+        return text
+    s = str(text)
+    s = _FULL_URL_QUERY_RE.sub(r"\1?[redacted]", s)
+    s = _LABELED_URL_QUERY_RE.sub(r"\1?[redacted]", s)
+    return s
+
+
+def _ip_blocked(ip):
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _resolve_public_ips(host):
+    """Resolve host; return public IPs or raise ValueError with a job-facing message."""
+    try:
+        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise ValueError(f"URL host does not resolve: {e}") from e
+    public, blocked = [], False
+    for _fam, _type, _proto, _canon, sockaddr in infos:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if _ip_blocked(ip):
+            blocked = True
+        else:
+            public.append(str(ip))
+    if blocked or not public:
+        raise ValueError("URL resolves to a blocked address")
+    return public
+
+
+def _url_error(url, what):
+    """Refuse non-https / private / link-local / loopback / optional non-R2 host. Returns err str or None.
+
+    Presigned mode otherwise lets any job submitter drive GET/PUT from the GPU worker (SSRF). Resolve
+    the hostname and reject blocked address classes; callers must also pass allow_redirects=False and
+    connect to a pre-validated IP (see _pinned_https) so DNS cannot rebind between check and fetch."""
+    try:
+        p = urlparse(str(url or ""))
+    except Exception:  # noqa: BLE001 -- malformed URL is a job error, not a crash
+        return f"{what}: malformed URL"
+    if p.scheme != "https" or not p.hostname:
+        return f"{what}: URL must be https with a hostname"
+    host = p.hostname.lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return f"{what}: URL host is blocked"
+    if R2_URL_HOST_SUFFIX:
+        suffix = R2_URL_HOST_SUFFIX if R2_URL_HOST_SUFFIX.startswith(".") else f".{R2_URL_HOST_SUFFIX}"
+        bare = suffix.lstrip(".")
+        if host != bare and not host.endswith(suffix):
+            return f"{what}: URL host must end with {R2_URL_HOST_SUFFIX}"
+    try:
+        _resolve_public_ips(host)
+    except ValueError as e:
+        return f"{what}: {e}"
+    return None
+
+
+def _pinned_https(method, url, *, timeout, headers=None, data=None, stream=False):
+    """HTTPS GET/PUT that resolves once, rejects private addrs, and connects to that IP (DNS-rebinding safe)."""
+    from requests.adapters import HTTPAdapter  # deferred: keeps CPU test stubs light
+
+    class _SniAdapter(HTTPAdapter):
+        """Keep TLS SNI / hostname verify on the original host while connecting to a pinned IP."""
+
+        def __init__(self, server_hostname, **kwargs):
+            self._server_hostname = server_hostname
+            super().__init__(**kwargs)
+
+        def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+            pool_kwargs["assert_hostname"] = self._server_hostname
+            pool_kwargs["server_hostname"] = self._server_hostname
+            return super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+
+    p = urlparse(str(url or ""))
+    if p.scheme != "https" or not p.hostname:
+        raise ValueError("URL must be https with a hostname")
+    host = p.hostname.lower()
+    ip = _resolve_public_ips(host)[0]
+    netloc_host = f"[{ip}]" if ":" in ip else ip
+    netloc = f"{netloc_host}:{p.port}" if p.port else netloc_host
+    pinned = urlunparse((p.scheme, netloc, p.path or "/", p.params, p.query, ""))
+    hdrs = dict(headers or {})
+    hdrs["Host"] = host if not p.port else f"{host}:{p.port}"
+    session = requests.Session()
+    session.mount("https://", _SniAdapter(host))
+    return session.request(method, pinned, timeout=timeout, headers=hdrs, data=data,
+                           stream=stream, allow_redirects=False)
+
+
 R2_BUCKET = os.environ.get("R2_BUCKET", "vivijure")
 
 
@@ -1043,10 +1147,14 @@ def _stamp_sidecar_presigned(hash_url, output_hash):
     provenance once the core presigns hash_url. Same opaque + best-effort contract."""
     if not (hash_url and output_hash):
         return
+    if _url_error(hash_url, "hash_url"):
+        return
     try:
         body = str(output_hash).encode("utf-8")
-        requests.put(hash_url, data=body, timeout=UPLOAD_TIMEOUT,
-                     headers={"content-type": "text/plain", "content-length": str(len(body))}).raise_for_status()
+        _pinned_https(
+            "PUT", hash_url, timeout=UPLOAD_TIMEOUT, data=body,
+            headers={"content-type": "text/plain", "content-length": str(len(body))},
+        ).raise_for_status()
     except Exception:  # noqa: BLE001 -- best-effort provenance; a miss = safe re-run
         pass
 
@@ -1100,9 +1208,9 @@ def _upscale_r2(inp):
         # FAILED envelope which books a `failed` job row for a job that degraded honestly. Ordinary
         # errors below keep `error` on purpose -- they ARE failures, and the legacy shape is still
         # recovered by the panel's FAILED-envelope route.
-        return {"ok": False, "detail": str(e)[:120]}
+        return {"ok": False, "detail": _redact_query(str(e)[:120])}
     except Exception as e:  # noqa: BLE001 -- a job error is data, returned to the caller
-        return {"ok": False, "error": str(e)[:500]}
+        return {"ok": False, "error": _redact_query(str(e)[:500])}
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -1158,7 +1266,7 @@ def _selftest_r2(final_scale, model_name, requested, target_height=None):
         leg["model"] = model_name
         return leg
     except Exception as e:  # noqa: BLE001 -- a job error is data, returned to the caller
-        leg["error"] = str(e)[:500]
+        leg["error"] = _redact_query(str(e)[:500])
         return leg
     finally:
         # delete the test objects + any provenance sidecar (best effort -- never mask a real result)
@@ -1185,11 +1293,18 @@ def handler(job):
         final_scale, target_height = _parse_size_knobs(inp)
     except SizeRequestError as e:
         return {"ok": False, "error": str(e)}
+    for u, name in ((video_url, "video_url"), (output_url, "output_url"),
+                    (inp.get("hash_url"), "hash_url")):
+        if name == "hash_url" and not u:
+            continue
+        err = _url_error(u, name)
+        if err:
+            return {"ok": False, "error": err}
     model_name = str(inp.get("model", "realesr-animevideov3"))
     work = tempfile.mkdtemp(prefix="up-")
     src, dst = os.path.join(work, "in.mp4"), os.path.join(work, "out.mp4")
     try:
-        with requests.get(video_url, stream=True, timeout=DOWNLOAD_TIMEOUT) as r:
+        with _pinned_https("GET", video_url, timeout=DOWNLOAD_TIMEOUT, stream=True) as r:
             r.raise_for_status()
             with open(src, "wb") as f:
                 for chunk in r.iter_content(1 << 20):
@@ -1200,8 +1315,9 @@ def handler(job):
         if not size:
             return {"ok": False, "error": "upscale produced no output"}
         with open(dst, "rb") as f:
-            put = requests.put(output_url, data=f, timeout=UPLOAD_TIMEOUT,
-                               headers={"content-type": "video/mp4", "content-length": str(size)})
+            put = _pinned_https(
+                "PUT", output_url, timeout=UPLOAD_TIMEOUT, data=f,
+                headers={"content-type": "video/mp4", "content-length": str(size)})
         put.raise_for_status()
         _stamp_sidecar_presigned(inp.get("hash_url"), inp.get("output_hash"))  # #583: sidecar AFTER the artifact
         return {"ok": True, "output_key": output_key, "bytes": size,
@@ -1211,9 +1327,9 @@ def handler(job):
                 "applied": [_applied_tag(info["out_h"], info["scale"],
                                          from_target_height=target_height is not None)]}
     except InvocationExpired as e:  # same soft-degrade contract as the R2 path above
-        return {"ok": False, "detail": str(e)[:120]}
+        return {"ok": False, "detail": _redact_query(str(e)[:120])}
     except Exception as e:  # noqa: BLE001 -- a job error is data, returned to the caller
-        return {"ok": False, "error": str(e)[:500]}
+        return {"ok": False, "error": _redact_query(str(e)[:500])}
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
