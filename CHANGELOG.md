@@ -8,6 +8,14 @@ file records the why behind each release. Newest first.
 
 ## Unreleased
 
+- **fix(serve): an oversize or unparseable POST /run is no longer accepted as an empty job (#106).**
+  `_body()` answered `None` for no body, a body past the 1 MiB cap, and a body that would not
+  parse, and `/run` then did `(body or {}).get("input", body or {})`, so all three were accepted
+  with `200` and a job id. The caller got a success shape for a request that was never honoured,
+  and the job failed later naming a missing field rather than the body. Now `413` and `400`
+  respectively, checked AFTER authentication so an unauthenticated caller still gets `401` and
+  learns nothing about the cap. Ported from vivijure-blender.
+
 - **fix(security): SSRF-gate presigned GET/PUT and redact query strings in errors.** Presigned
   `video_url` / `output_url` / `hash_url` now follow the musetalk / audio-upscale guard: https
   only, no localhost, DNS-resolve and refuse private / loopback / link-local / metadata
