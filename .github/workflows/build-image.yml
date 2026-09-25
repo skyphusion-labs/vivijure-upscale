@@ -26,11 +26,16 @@ name: build-image
 # current one, since it is the tag most likely to be pulled by accident and
 # would silently serve an old image. See skyphusion-labs/fleet-chezmoi#1630.
 #
-# Runner: Plane C `[self-hosted, bake-capable]` (org group vivijure-gpu-builds,
-# allow-public ON, workflow-restricted). This repo is PUBLIC, but the bake is
-# tag/dispatch gated so it is not fork-reachable; Plane C is the lane. Do not
-# use the retired vivijure-bake* labels. Disk-reclaim below stays hosted-only
-# (Plane C has TB-class disk).
+# Runner: GitHub-hosted `ubuntu-latest`. The self-hosted pools are GONE. Plane C
+# `[self-hosted, bake-capable]` (org group vivijure-gpu-builds, allow-public ON,
+# workflow-restricted) died with the fleet, which was decommissioned 2026-09-24 on
+# cost; the vivijure-bake* labels were retired before that. A job left pinned to a
+# dead label does not fail, it QUEUES FOREVER and silently, so hosted is the only
+# live plane. This repo is PUBLIC and the bake stays tag/dispatch gated, so it is
+# still not fork-reachable. The disk-reclaim step below is now LOAD-BEARING rather
+# than dormant: its `runner.environment == 'github-hosted'` guard is TRUE here, and
+# a hosted runner has nothing like the old TB-class bake disk (this image is ~10.7 GB
+# compressed).
 
 on:
   workflow_dispatch:
@@ -60,9 +65,12 @@ jobs:
     # fc#1628: this guard lived on the removed sync-gpu-allowlist job, which was the
     # only thing stopping a non-tag push from baking. It moves here rather than vanishing.
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    # PUBLIC repo, tag/dispatch gated: Plane C (allow-public ON, workflow-restricted).
-    # Not the retired vivijure-bake* labels.
-    runs-on: [self-hosted, bake-capable]
+    # PUBLIC repo, tag/dispatch gated, so a hosted runner is fork-safe here. Plane C
+    # (allow-public ON, workflow-restricted) is HISTORY, as are the retired
+    # vivijure-bake* labels: the fleet was decommissioned 2026-09-24 and a dead label
+    # queues instead of failing. ubuntu-latest is the only live plane, and this image
+    # has 12 prior successful bakes there.
+    runs-on: ubuntu-latest
     timeout-minutes: 240
     env:
       IMAGE: ghcr.io/skyphusion-labs/vivijure-upscale
