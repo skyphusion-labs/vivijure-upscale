@@ -78,7 +78,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Free disk space (hosted runners only; Plane C has TB-class disk)
+      - name: Free disk space (hosted runner; replaces the disk headroom Plane C had)
         if: runner.environment == 'github-hosted'
         run: |
           set -eu
