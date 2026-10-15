@@ -35,6 +35,9 @@ Job input (presigned mode):
   }
 Returns: { ok, output_key, bytes, scale, out_w, out_h, model, frames, encoder } on success. Two non-ok shapes, and
 the difference is deliberate (#105):
+  { ok: false, error, error_type }   a failure. error_type is a closed set decided at the return
+                                    (not-configured, backend-error, internal, bad-input), never
+                                    parsed from the message. The soft-degrade shape does not carry it.
   { ok: false, detail: "<reason>" }  the WALL-CLOCK GUARD expired -- an honest soft degrade. `detail`
                                     is the key vivijure-cf's degradeReason reads first, and it does
                                     NOT get lifted into a RunPod FAILED envelope, so an honest degrade
@@ -858,6 +861,19 @@ class _GpuSampler(threading.Thread):
         return out
 
 
+CLOSED_ERROR_TYPES = frozenset({"not-configured", "backend-error", "internal", "bad-input"})
+
+
+def _failure(error_type, error, **extra):
+    """A failure return. The caller picks the class. A value outside the closed set raises,
+    so a near-miss spelling cannot ship as data. Do not call this for a soft degrade."""
+    if error_type not in CLOSED_ERROR_TYPES:
+        raise ValueError(f"error_type {error_type!r} is not in {sorted(CLOSED_ERROR_TYPES)}")
+    out = {"ok": False, "error": error, "error_type": error_type}
+    out.update(extra)
+    return out
+
+
 def _selftest(inp):
     """Deploy verification. With an explicit `model`, run just that one (back-compat). WITHOUT a model,
     SWEEP every shipped model so a heavy model (RealESRGAN_x4plus) is exercised on silicon at a realistic
@@ -872,7 +888,7 @@ def _selftest(inp):
     try:
         final_scale, target_height = _parse_size_knobs(inp)
     except SizeRequestError as e:
-        return {"ok": False, "selftest": True, "error": str(e)}
+        return _failure("bad-input", str(e), selftest=True)
     r2_requested = bool(inp.get("r2"))
     res, dur = str(inp.get("res", "1280x720")), inp.get("dur", 3)
     requested = inp.get("model")
@@ -927,6 +943,7 @@ def _selftest_one(model_name, final_scale, res="1280x720", dur=3, target_height=
         )
         if gen.returncode != 0:
             out["error"] = f"ffmpeg gen failed: {(gen.stderr or '')[-500:]}"
+            out["error_type"] = "backend-error"
             return out
         out["input_res"] = "x".join(_ffprobe(src, "stream=width,height"))
         sampler.start()
@@ -937,6 +954,7 @@ def _selftest_one(model_name, final_scale, res="1280x720", dur=3, target_height=
         sampler.join(timeout=2)
         if not os.path.exists(dst) or os.path.getsize(dst) == 0:
             out["error"] = "no output produced"
+            out["error_type"] = "backend-error"
             return out
         out["frames"] = info["frames"]
         out["encoder"] = info["encoder"]
@@ -956,11 +974,14 @@ def _selftest_one(model_name, final_scale, res="1280x720", dur=3, target_height=
         out["ok"] = True
         return out
     except InvocationExpired as e:  # BaseException-derived: the broad handler below cannot see it
-        out["error"] = str(e)[:800]  # a selftest reports diagnostics, not a chain degrade
+        # No error_type. This is a selftest diagnostic (guard_expired), not the job
+        # degrade channel and not a failure class we can honestly name here.
+        out["error"] = str(e)[:800]
         out["guard_expired"] = True
         return out
     except Exception as e:  # noqa: BLE001 -- a job error is data, returned to the caller
         out["error"] = str(e)[:800]
+        out["error_type"] = "internal"
         return out
     finally:
         sampler.stop()
@@ -1166,20 +1187,23 @@ def _upscale_r2(inp):
     project = inp.get("project")
     err = _scoped_key_error(clip_key, "clip_key", project=project)
     if err:
-        return {"ok": False, "error": err}
+        return _failure("bad-input", err)
     name = clip_key.rsplit("/", 1)[-1]
     output_key = inp.get("output_key") or (
         f"{clip_key.rsplit('.', 1)[0]}_up.{clip_key.rsplit('.', 1)[1]}" if "." in name else f"{clip_key}_up")
     err = _scoped_key_error(output_key, "output_key", project=project)
     if err:
-        return {"ok": False, "error": err}
+        return _failure("bad-input", err)
     try:
         final_scale, target_height = _parse_size_knobs(inp)
     except SizeRequestError as e:
-        return {"ok": False, "error": str(e)}
+        return _failure("bad-input", str(e))
     model_name = str(inp.get("model", "realesr-animevideov3"))
     if not (R2_ENDPOINT and os.environ.get("R2_ACCESS_KEY_ID")):
-        return {"ok": False, "error": "R2 mode needs R2_ENDPOINT_URL + R2_ACCESS_KEY_ID/SECRET in the endpoint env"}
+        return _failure(
+            "not-configured",
+            "R2 mode needs R2_ENDPOINT_URL + R2_ACCESS_KEY_ID/SECRET in the endpoint env",
+        )
     work = tempfile.mkdtemp(prefix="up-")
     src, dst = os.path.join(work, "in.mp4"), os.path.join(work, "out.mp4")
     try:
@@ -1188,7 +1212,7 @@ def _upscale_r2(inp):
         model = _load_model(model_name)
         info = _upscale_video(model, src, dst, final_scale, target_height=target_height)
         if not os.path.getsize(dst):
-            return {"ok": False, "error": "upscale produced no output"}
+            return _failure("backend-error", "upscale produced no output")
         s3.upload_file(dst, R2_BUCKET, output_key, ExtraArgs={"ContentType": "video/mp4"})
         _stamp_sidecar_r2(s3, output_key, inp.get("output_hash"))  # #583: sidecar AFTER the artifact
         return {"ok": True, "clip_key": output_key, "bytes": os.path.getsize(dst),
@@ -1210,7 +1234,7 @@ def _upscale_r2(inp):
         # recovered by the panel's FAILED-envelope route.
         return {"ok": False, "detail": _redact_query(str(e)[:120])}
     except Exception as e:  # noqa: BLE001 -- a job error is data, returned to the caller
-        return {"ok": False, "error": _redact_query(str(e)[:500])}
+        return _failure("internal", _redact_query(str(e)[:500]))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -1226,8 +1250,11 @@ def _selftest_r2(final_scale, model_name, requested, target_height=None):
                       and os.environ.get("R2_SECRET_ACCESS_KEY"))
     if not have_creds:
         if requested:
-            return {"ok": False, "requested": True,
-                    "error": "R2 leg requested but R2_ENDPOINT_URL + R2_ACCESS_KEY_ID/SECRET are not set"}
+            return _failure(
+                "not-configured",
+                "R2 leg requested but R2_ENDPOINT_URL + R2_ACCESS_KEY_ID/SECRET are not set",
+                requested=True,
+            )
         return {"ok": None, "skipped": "no creds"}
     tag = f"{os.getpid()}-{int(time.time())}"
     clip_key = f"renders/_selftest/upscale-{tag}.mp4"
@@ -1244,6 +1271,7 @@ def _selftest_r2(final_scale, model_name, requested, target_height=None):
         )
         if gen.returncode != 0:
             leg["error"] = f"ffmpeg gen failed: {(gen.stderr or '')[-300:]}"
+            leg["error_type"] = "backend-error"
             return leg
         s3.upload_file(src, R2_BUCKET, clip_key, ExtraArgs={"ContentType": "video/mp4"})
         r2_job = {"project": "_selftest", "clip_key": clip_key, "output_key": output_key,
@@ -1267,6 +1295,7 @@ def _selftest_r2(final_scale, model_name, requested, target_height=None):
         return leg
     except Exception as e:  # noqa: BLE001 -- a job error is data, returned to the caller
         leg["error"] = _redact_query(str(e)[:500])
+        leg["error_type"] = "internal"
         return leg
     finally:
         # delete the test objects + any provenance sidecar (best effort -- never mask a real result)
@@ -1288,18 +1317,18 @@ def handler(job):
     output_url = inp.get("output_url")
     output_key = inp.get("output_key", "")
     if not video_url or not output_url:
-        return {"ok": False, "error": "input needs presigned video_url + output_url"}
+        return _failure("bad-input", "input needs presigned video_url + output_url")
     try:
         final_scale, target_height = _parse_size_knobs(inp)
     except SizeRequestError as e:
-        return {"ok": False, "error": str(e)}
+        return _failure("bad-input", str(e))
     for u, name in ((video_url, "video_url"), (output_url, "output_url"),
                     (inp.get("hash_url"), "hash_url")):
         if name == "hash_url" and not u:
             continue
         err = _url_error(u, name)
         if err:
-            return {"ok": False, "error": err}
+            return _failure("bad-input", err)
     model_name = str(inp.get("model", "realesr-animevideov3"))
     work = tempfile.mkdtemp(prefix="up-")
     src, dst = os.path.join(work, "in.mp4"), os.path.join(work, "out.mp4")
@@ -1313,7 +1342,7 @@ def handler(job):
         info = _upscale_video(model, src, dst, final_scale, target_height=target_height)
         size = os.path.getsize(dst)
         if not size:
-            return {"ok": False, "error": "upscale produced no output"}
+            return _failure("backend-error", "upscale produced no output")
         with open(dst, "rb") as f:
             put = _pinned_https(
                 "PUT", output_url, timeout=UPLOAD_TIMEOUT, data=f,
@@ -1329,7 +1358,7 @@ def handler(job):
     except InvocationExpired as e:  # same soft-degrade contract as the R2 path above
         return {"ok": False, "detail": _redact_query(str(e)[:120])}
     except Exception as e:  # noqa: BLE001 -- a job error is data, returned to the caller
-        return {"ok": False, "error": _redact_query(str(e)[:500])}
+        return _failure("internal", _redact_query(str(e)[:500]))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
