@@ -70,15 +70,21 @@ GPU-bound by removing the per-frame PNG roundtrip and batching in fp16 (issue #7
 
 ## Commands
 
-This is a Python / RunPod image, NOT an npm package. There is no local test suite; verification is the
-build-time NVENC assert plus the GPU-gated selftest.
+This is a Python / RunPod image, NOT an npm package. CPU unit tests live in `tests/` and CI runs
+them (`python -m pytest -q tests/`, no GPU; heavy deps are stubbed). They do not prove the image.
+The image gate is still a clean `docker build` (the Dockerfile fails if `h264_nvenc` is not
+compiled into ffmpeg) plus the GPU selftest.
 
 ```bash
-# Build the image locally (CI does this on push). The build FAILS if h264_nvenc is not compiled into ffmpeg.
-docker build -t vivijure-upscale:dev .
+# CPU unit tests. This is what `.github/workflows/ci.yml` runs on push and pull_request.
+python -m pytest -q tests/
 
-# Lint the handler without a GPU.
+# Syntax-check the handler without a GPU (also in ci.yml).
 python -m py_compile handler.py
+
+# Build the image locally. CI builds it only on a v*.*.* tag or workflow_dispatch, not on a bare push to main.
+# The build FAILS if h264_nvenc is not compiled into ffmpeg.
+docker build -t vivijure-upscale:dev .
 
 # GPU verify: send {"selftest": true} on a pinned endpoint / live pod; assert ok:true AND nvenc_used:true.
 ```
@@ -88,12 +94,15 @@ python -m py_compile handler.py
 `R2_SECRET_ACCESS_KEY`). Size `UPSCALE_BATCH` to the card's VRAM (B16 ~8.7 GiB at 720p, ~17 GiB at
 1080p). See the README "Tunables" table.
 
-**Release / deploy mechanics.** `.github/workflows/build-image.yml` builds + pushes to GHCR on a push to
-`main` (touching the build inputs) as `:latest` + `:<sha>`; a pushed SemVer tag (`vMAJOR.MINOR.PATCH`)
-ALSO publishes the matching bare `:MAJOR.MINOR.PATCH` (pin prod to that immutable tag, not `:latest`
-alone). PUBLIC repo; CI on GitHub-hosted `ubuntu-latest`. Operator sets endpoint image tag, GPU type,
-and R2 env (**never freeze endpoint IDs here**). Registry-auth is MCP/API-manageable
-(`containerRegistryAuthId` on template).
+**Release / deploy mechanics.** `.github/workflows/build-image.yml` publishes to GHCR only on a
+pushed SemVer tag (`v*.*.*`) or `workflow_dispatch`. A push to `main` does not build or push this
+image: the build job's `if` is tag or dispatch only, even when image inputs change. A tag publishes
+`ghcr.io/skyphusion-labs/vivijure-upscale` as the clean version, `major.minor`, and a short sha
+(`docker/metadata-action`; `latest=auto` also tags `:latest` on a semver tag; do not pin `:latest`).
+The same job publishes the matching `-serve` tags. Before the bake, a tag run asserts the tagged
+commit is an ancestor of `origin/main`. PUBLIC repo; CI on GitHub-hosted `ubuntu-latest`. Operator
+sets endpoint image tag, GPU type, and R2 env (**never freeze endpoint IDs here**). Registry-auth
+is MCP/API-manageable (`containerRegistryAuthId` on template; `deploy.sh` sends that field).
 
 ## RunPod GPU config
 
@@ -209,8 +218,9 @@ Treat the image-extracted files as the source of truth they reconstruct.
 
 ## Commits & versioning
 
-Conventional Commits (`feat(scope):`, `fix(scope):`, `docs:`); body explains the why. SemVer-style
-`0.MINOR.PATCH` while pre-1.0 (PATCH for fixes / backend tweaks, MINOR for features). A release is a
+Conventional Commits (`feat(scope):`, `fix(scope):`, `docs:`); body explains the why. SemVer
+`vMAJOR.MINOR.PATCH`. The line is 1.x (`CHANGELOG.md` headed releases and git tags `v*`), not a
+pre-1.0 `0.MINOR.PATCH` scheme. Do not freeze a patch number in this file. A release is a
 pushed `vMAJOR.MINOR.PATCH` git tag on `main` (CI publishes the matching immutable image tag).
 
 ## Release / deploy
