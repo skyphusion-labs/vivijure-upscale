@@ -5,9 +5,9 @@ name: build-image
 # Unified image workflow (mirrors the slate image.yml shape): a pushed SemVer tag
 # (v0.2.6) publishes the immutable, pinnable release image tagged with the clean
 # version (0.2.6), the major.minor (0.2), and the short commit sha (sha-abc1234).
-# A push to main that touches the image inputs still BUILDS the image as a smoke
-# but does NOT push it; only a pushed version tag (or a manual workflow_dispatch)
-# publishes to GHCR. A bare merge to main never publishes.
+# A push to main that touches the image inputs triggers the workflow, but the
+# build job is skipped (it runs only on a pushed version tag or a manual
+# workflow_dispatch), so a bare merge to main neither builds nor publishes.
 #
 # :latest EXISTS and TRACKS THE NEWEST RELEASE. NOTHING MAY EVER PIN IT. RunPod
 # endpoints, compose files and the connectivity-directory pin system
