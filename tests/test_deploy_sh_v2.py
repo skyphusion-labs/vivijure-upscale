@@ -10,6 +10,7 @@ import shutil
 import stat
 import subprocess
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -77,7 +78,8 @@ def test_fresh_deploy_posts_one_v2_endpoint_carrying_everything(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     assert calls == ["GET https://api.runpod.io/v2/serverless?limit=1000",
                      "POST https://api.runpod.io/v2/serverless"]
-    assert not any("/templates" in c or "rest.runpod.io" in c for c in calls)
+    assert not any("/templates" in c for c in calls)
+    assert {urlsplit(c.split(" ", 1)[1]).hostname for c in calls} == {"api.runpod.io"}
     b = sent[0]
     assert b["name"] == "my-endpoint" and b["image"] == "ghcr.io/example/repo:1.2.3"
     assert b["gpu"] == {"pools": ["BLACKWELL_96"], "count": 1}
