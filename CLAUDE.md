@@ -11,7 +11,7 @@ that upscales video with **Real-ESRGAN** run on PyTorch/CUDA via
 [spandrel](https://github.com/chaiNNer-org/spandrel): stream frames through ffmpeg pipes -> upscale in
 BATCHES on the GPU (fp16) -> re-encode (NVENC), audio copied through when present. No per-frame PNG disk
 roundtrip; the GPU is the bottleneck, not I/O. Finish-class: it raises the assembled film's resolution,
-and is the natural partner that returns a MuseTalk-synced shot to delivery res.
+and could return a lip-synced shot to delivery res (the MuseTalk satellite it used to pair with is archived).
 
 This repo is the image + the RunPod handler; the studio-side `upscale` module worker (thin module on
 `vivijure-cf` / `vivijure-local`, types from `vivijure-core`) is what calls this endpoint. Image:
@@ -24,9 +24,9 @@ do not freeze a single version here as current forever.
    vivijure-cf / vivijure-local  (panels; core: vivijure-core)
             |
             v
-   vivijure-backend + finish satellites
+   vivijure-backend (RunPod SDXL keyframes) + this finish satellite
             |
-     musetalk | upscale (THIS) | audio-upscale | wan-train | local-12/16gb
+     upscale (THIS) | local-12/16gb
 ```
 
 ## Handler contract (the job, `handler.py`)
@@ -109,7 +109,7 @@ is MCP/API-manageable (`containerRegistryAuthId` on template; `deploy.sh` sends 
 GPU-bound module, so the endpoint should pin a card with hardware NVENC and enough VRAM for the batch,
 NOT the cheapest card (GPU-rationing thesis: a faster card finishes in fewer billed seconds). Recommended:
 an Ada / Blackwell-Pro card with NVENC (L4 / L40S sm_89, or RTX PRO 6000 sm_120). Avoid cards without
-usable NVENC. **No `TORCH_CUDA_ARCH_LIST` to maintain here** (unlike the sibling musetalk image): nothing
+usable NVENC. **No `TORCH_CUDA_ARCH_LIST` to maintain here** (unlike the archived musetalk image): nothing
 compiles from source, torch kernels come from the `runpod/pytorch` cu1281 base, so the image is
 GPU-agnostic. GPU type is set on the endpoint, not in this repo.
 
@@ -117,7 +117,7 @@ GPU-agnostic. GPU type is set on the endpoint, not in this repo.
 
 `Dockerfile.serve` + `serve.py` + `runpod_http_serve.py` layer a RunPod-compatible `/run` +
 `/status` HTTP server on the SAME base image the serverless worker ships, so the door runs resident
-on our own GPU boxes instead of paying a serverless cold start per job.
+on a GPU box you run instead of paying a serverless cold start per job.
 
 - **Published, not hand-built.** `build-image.yml` publishes `<version>-serve`,
   `<major>.<minor>-serve` and `sha-<short>-serve` alongside every release tag, from the same job,
@@ -129,9 +129,8 @@ on our own GPU boxes instead of paying a serverless cold start per job.
   two releases behind the current version, and its failure mode is a door that WORKS on a stale
   base (#89 item 2). Docker refuses an empty `FROM` at parse time, before any pull. The resulting
   `InvalidDefaultArgInFrom` warning is the intended shape, not a defect to "fix" back.
-- **Port 8012** by default (`PORT`); the speech door (`vivijure-audio-upscale`) is 8013, so both
-  can be resident on one card without a collision. Bind the published port to the VLAN address,
-  never `0.0.0.0`.
+- **Port 8012** by default (`PORT`). (The speech door, `vivijure-audio-upscale`, used 8013; that
+  repo is archived.) Bind the published port to a private address, never `0.0.0.0`.
 - **`/health` is auth-free liveness only** and never touches the GPU, the model or the handler.
   The deploy check that CAN fail is `POST /run {"selftest": true}`, which this overlay FORWARDS to
   the handler (#88 -- it used to intercept it, which made the documented check structurally
@@ -221,10 +220,11 @@ Treat the image-extracted files as the source of truth they reconstruct.
 Conventional Commits (`feat(scope):`, `fix(scope):`, `docs:`); body explains the why. SemVer
 `vMAJOR.MINOR.PATCH`. The line is 1.x (`CHANGELOG.md` headed releases and git tags `v*`), not a
 pre-1.0 `0.MINOR.PATCH` scheme. Do not freeze a patch number in this file. A release is a
-pushed `vMAJOR.MINOR.PATCH` git tag on `main` (CI publishes the matching immutable image tag).
+PR, then an org admin tags its merge commit `vMAJOR.MINOR.PATCH` (CI publishes the matching immutable image tag).
 
 ## Release / deploy
 
 **Tag-gated production deploy.** Merges to `main` run CI only; they do not ship production.
-Cut an annotated SemVer tag on `main` to release (`git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z`).
+To release, merge a release PR; then an org admin tags that PR's merge commit
+(`sha="$(gh pr view <release-pr> --json mergeCommit -q .mergeCommit.oid)"; git tag -a vX.Y.Z -m "..." "$sha" && git push origin vX.Y.Z`).
 Deploy workflows assert the tag commit is an ancestor of `origin/main`.
