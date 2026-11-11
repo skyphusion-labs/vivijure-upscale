@@ -184,7 +184,9 @@ if [ -n "$EP_ID" ]; then
   api PATCH "/serverless/$EP_ID" "$EP_BODY" >/dev/null || die "endpoint update failed"
 else
   info "creating endpoint $ENDPOINT_NAME"
-  EP_ID="$(api POST /serverless "$EP_BODY" | pyget id)"
+  # v2 requires the request-routing type on create; it is fixed then, and an update does not take it.
+  CREATE_BODY="$(printf "%s" "$EP_BODY" | python3 -c "import sys,json; o=json.load(sys.stdin); o[\"type\"]=\"QUEUE\"; print(json.dumps(o))")" || die "could not build the create body"
+  EP_ID="$(api POST /serverless "$CREATE_BODY" | pyget id)"
   [ -n "$EP_ID" ] || die "could not read the new endpoint id"
   info "created endpoint $EP_ID"
 fi
