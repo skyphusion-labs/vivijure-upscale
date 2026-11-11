@@ -182,7 +182,7 @@ their own GitHub identity.
 
 Vivijure operators wiring **video upscale finish** on RunPod GPU (Real-ESRGAN super-resolution for final delivery).
 
-**Vivijure Studio:** https://vivijure.com · **Live demo:** https://demo.vivijure.com · **Skyphusion Labs:** https://skyphusion.org
+**Vivijure Studio:** https://vivijure.dev · **Live demo:** https://demo.vivijure.com · **Skyphusion Labs:** https://skyphusion.org
 
 ## Support
 
