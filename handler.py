@@ -864,12 +864,20 @@ class _GpuSampler(threading.Thread):
 CLOSED_ERROR_TYPES = frozenset({"not-configured", "backend-error", "internal", "bad-input"})
 
 
+def _stamp_error_type(out, error_type):
+    """The only write of an error_type key. Selftest diagnostics are not _failure returns,
+    but they take the same membership check, so a spelling outside the set raises here too."""
+    if error_type not in CLOSED_ERROR_TYPES:
+        raise ValueError(f"error_type {error_type!r} is not in {sorted(CLOSED_ERROR_TYPES)}")
+    out["error_type"] = error_type
+    return out
+
+
 def _failure(error_type, error, **extra):
     """A failure return. The caller picks the class. A value outside the closed set raises,
     so a near-miss spelling cannot ship as data. Do not call this for a soft degrade."""
-    if error_type not in CLOSED_ERROR_TYPES:
-        raise ValueError(f"error_type {error_type!r} is not in {sorted(CLOSED_ERROR_TYPES)}")
-    out = {"ok": False, "error": error, "error_type": error_type}
+    out = {"ok": False, "error": error}
+    _stamp_error_type(out, error_type)
     out.update(extra)
     return out
 
@@ -943,7 +951,7 @@ def _selftest_one(model_name, final_scale, res="1280x720", dur=3, target_height=
         )
         if gen.returncode != 0:
             out["error"] = f"ffmpeg gen failed: {(gen.stderr or '')[-500:]}"
-            out["error_type"] = "backend-error"
+            _stamp_error_type(out, "backend-error")
             return out
         out["input_res"] = "x".join(_ffprobe(src, "stream=width,height"))
         sampler.start()
@@ -954,7 +962,7 @@ def _selftest_one(model_name, final_scale, res="1280x720", dur=3, target_height=
         sampler.join(timeout=2)
         if not os.path.exists(dst) or os.path.getsize(dst) == 0:
             out["error"] = "no output produced"
-            out["error_type"] = "backend-error"
+            _stamp_error_type(out, "backend-error")
             return out
         out["frames"] = info["frames"]
         out["encoder"] = info["encoder"]
@@ -981,7 +989,7 @@ def _selftest_one(model_name, final_scale, res="1280x720", dur=3, target_height=
         return out
     except Exception as e:  # noqa: BLE001 -- a job error is data, returned to the caller
         out["error"] = str(e)[:800]
-        out["error_type"] = "internal"
+        _stamp_error_type(out, "internal")
         return out
     finally:
         sampler.stop()
@@ -1271,7 +1279,7 @@ def _selftest_r2(final_scale, model_name, requested, target_height=None):
         )
         if gen.returncode != 0:
             leg["error"] = f"ffmpeg gen failed: {(gen.stderr or '')[-300:]}"
-            leg["error_type"] = "backend-error"
+            _stamp_error_type(leg, "backend-error")
             return leg
         s3.upload_file(src, R2_BUCKET, clip_key, ExtraArgs={"ContentType": "video/mp4"})
         r2_job = {"project": "_selftest", "clip_key": clip_key, "output_key": output_key,
@@ -1295,7 +1303,7 @@ def _selftest_r2(final_scale, model_name, requested, target_height=None):
         return leg
     except Exception as e:  # noqa: BLE001 -- a job error is data, returned to the caller
         leg["error"] = _redact_query(str(e)[:500])
-        leg["error_type"] = "internal"
+        _stamp_error_type(leg, "internal")
         return leg
     finally:
         # delete the test objects + any provenance sidecar (best effort -- never mask a real result)
