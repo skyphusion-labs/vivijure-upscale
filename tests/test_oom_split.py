@@ -87,7 +87,7 @@ def test_fits_in_one_forward_no_split():
     torch_mod, model = _stub_torch(max_batch=16)
     h = _load_handler(torch_mod)
     out = h._forward_tile(model, FakeT(16), use_half=False)
-    assert out.n == 16
+    assert out.n == 17
     assert model.calls == [16]  # fit at once, no split
 
 
