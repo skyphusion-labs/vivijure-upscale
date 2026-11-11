@@ -8,6 +8,11 @@ file records the why behind each release. Newest first.
 
 ## Unreleased
 
+- **fix(handler): selftest error_type writes go through the closed set (#132).** Five
+  selftest sites assigned the key directly, so a spelling outside the set could ship
+  from those paths while `_failure` still raised. Every write now goes through
+  `_stamp_error_type`, and a source scan fails if a later assignment skips it.
+
 - **fix(serve): an oversize or unparseable POST /run is no longer accepted as an empty job (#106).**
   `_body()` answered `None` for no body, a body past the 1 MiB cap, and a body that would not
   parse, and `/run` then did `(body or {}).get("input", body or {})`, so all three were accepted

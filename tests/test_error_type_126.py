@@ -5,6 +5,7 @@ arm keeps `detail` and does not gain a failure class. A spelling outside the clo
 raises, so the set cannot silently become a free string.
 """
 
+import ast
 import os
 import sys
 import types
@@ -47,6 +48,59 @@ def test_closed_set_rejects_a_near_miss_and_a_non_member():
         handler._failure("not_configured", "x")
     with pytest.raises(ValueError):
         handler._failure("quota", "x")
+    with pytest.raises(ValueError):
+        handler._stamp_error_type({}, "quota")
+
+
+def _is_error_type_subscript(node):
+    return (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.slice, ast.Constant)
+        and node.slice.value == "error_type"
+    )
+
+
+def test_every_error_type_assignment_stays_inside_the_closed_set():
+    """A raw `obj["error_type"] = ...` bypasses the membership check. Parse the
+    handler and reject any such write, or any dict key of that name, outside
+    `_stamp_error_type`. Removing the stamp from a selftest site goes red here."""
+    src_path = os.path.join(os.path.dirname(handler.__file__), "handler.py")
+    tree = ast.parse(open(src_path, encoding="utf-8").read())
+    owners = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+    ]
+
+    def owner_of(lineno):
+        hits = [fn for fn in owners if fn.lineno <= lineno <= (fn.end_lineno or fn.lineno)]
+        return min(hits, key=lambda fn: (fn.end_lineno or fn.lineno) - fn.lineno) if hits else None
+
+    writes = []
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and node.target is not None:
+            targets = [node.target]
+        for target in targets:
+            if _is_error_type_subscript(target):
+                writes.append(node)
+        if isinstance(node, ast.Dict):
+            for key in node.keys:
+                if isinstance(key, ast.Constant) and key.value == "error_type":
+                    writes.append(node)
+
+    assert writes, "the scan saw no error_type write; it cannot prove the set is closed"
+    for node in writes:
+        fn = owner_of(node.lineno)
+        assert fn is not None and fn.name == "_stamp_error_type", (
+            f"error_type write at handler.py:{node.lineno} is outside _stamp_error_type"
+        )
+
+    stamped = {}
+    handler._stamp_error_type(stamped, "internal")
+    assert stamped["error_type"] == "internal"
+    assert stamped["error_type"] in handler.CLOSED_ERROR_TYPES
 
 
 def test_a_missing_r2_config_is_not_configured(monkeypatch):
