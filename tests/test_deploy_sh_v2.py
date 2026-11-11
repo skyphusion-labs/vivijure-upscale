@@ -81,6 +81,7 @@ def test_fresh_deploy_posts_one_v2_endpoint_carrying_everything(tmp_path):
     assert not any("/templates" in c for c in calls)
     assert {urlsplit(c.split(" ", 1)[1]).hostname for c in calls} == {"api.runpod.io"}
     b = sent[0]
+    assert b["type"] == "QUEUE"
     assert b["name"] == "my-endpoint" and b["image"] == "ghcr.io/example/repo:1.2.3"
     assert b["gpu"] == {"pools": ["BLACKWELL_96"], "count": 1}
     assert b["workers"]["min"] == 0 and "max" in b["workers"] and "idleTimeout" in b["workers"]
@@ -97,6 +98,7 @@ def test_an_existing_endpoint_on_a_later_page_is_updated_in_place(tmp_path):
                      "GET https://api.runpod.io/v2/serverless?limit=1000&cursor=p2",
                      "PATCH https://api.runpod.io/v2/serverless/ep-2"]
     assert sent[0]["image"] == "ghcr.io/example/repo:1.2.3"
+    assert "type" not in sent[0], "type is create-only on v2"
 
 
 def test_a_list_that_claims_more_without_a_cursor_stops_before_any_write(tmp_path):
