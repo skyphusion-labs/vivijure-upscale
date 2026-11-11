@@ -31,7 +31,7 @@ stops on the first error, so you never end up half-deployed.
 
 1. **Builds** the Docker image from this repo.
 2. **Pushes** it to your registry.
-3. **Creates a RunPod template and endpoint** (or reuses them if they already exist), pinned to the
+3. **Creates a RunPod endpoint** (or updates it in place if one with this name exists), pinned to the
    GPU you chose, set to scale to zero.
 4. **Prints the endpoint id** and reminds you how to wire it into the studio.
 
@@ -53,7 +53,9 @@ means and why.
   **hardware video encode (NVENC)** and only a few GB of VRAM, so it does not need a giant card. An
   **Ada** card like the **L4** or **L40S** is the sweet spot; a **Blackwell RTX PRO 6000** also works
   if Ada stock is thin. A faster card finishes in fewer billed seconds, so speed per dollar beats
-  sticker price. Example: `GPU_TYPE_IDS=NVIDIA L4,NVIDIA L40S`.
+  sticker price. Example: `GPU_TYPE_IDS="NVIDIA L4,NVIDIA L40S"` (quoted). RunPod's v2 API schedules
+  by GPU **pool**; `deploy.sh` maps each card to its pool, or set `GPU_POOLS` (for example
+  `AMPERE_24,ADA_48_PRO`) to name pools directly. A pool holds several cards of one class.
 
 ### The knobs you usually leave alone
 
@@ -196,9 +198,10 @@ Full context on the tiers is in the studio's `docs/opt-in-tiers.md` (the "finish
 
 ## Re-running and fixing things
 
-- Re-running `./deploy.sh` is safe. It reuses the template and endpoint it already made.
-- To change the endpoint's GPU or scaling after it exists, use the RunPod console; RunPod does not let
-  the API re-pin an endpoint's GPU list after creation.
+- Re-running `./deploy.sh` is safe. It updates the endpoint it already made, in place: image, env,
+  GPU pools, workers and timeout all follow `deploy.env`. (It uses RunPod's REST v2 API, where an
+  endpoint holds its own settings, so no template is made. An older deploy's `<name>-template` is no
+  longer used and may be deleted.)
 - If a push fails, make sure you ran `docker login` for your registry and that the repo exists there.
 - If the encode is slow and pegs the CPU, your card has no usable NVENC; the self-test result names the
   encoder that ran, so pick a card with hardware NVENC (L4 / L40S / Blackwell).

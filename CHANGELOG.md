@@ -8,6 +8,15 @@ file records the why behind each release. Newest first.
 
 ## Unreleased
 
+- **fix(deploy): deploy.sh moves to RunPod REST v2 (skyphusion-labs/fleet-chezmoi#2085).** RunPod REST v1
+  retires 2026-11-15. On v2 an endpoint carries its own image, env, disk and registry, and a template
+  no longer reaches it, so deploy.sh makes no template. It finds the endpoint by name across every list
+  page and updates it in place (image, env, GPU pools, workers, timeout), or creates it, at
+  `https://api.runpod.io/v2/serverless`. Before, a re-run left an existing endpoint as it was and moved
+  its image through the template, which v2 no longer does. GPUs are chosen by pool: `GPU_TYPE_IDS` is
+  mapped, or `GPU_POOLS` names pools directly. `deploy.env.example` now quotes `GPU_TYPE_IDS`;
+  unquoted, sourcing it stopped the deploy with "command not found".
+
 - **fix(handler): selftest error_type writes go through the closed set (#132).** Five
   selftest sites assigned the key directly, so a spelling outside the set could ship
   from those paths while `_failure` still raised. Every write now goes through

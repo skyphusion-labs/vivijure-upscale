@@ -22,7 +22,11 @@ say()  { printf "\n==> %s\n" "$*"; }
 info() { printf "    %s\n" "$*"; }
 die()  { printf "\nERROR: %s\n" "$*" >&2; exit 1; }
 
-API="https://rest.runpod.io/v1"
+# RunPod REST v2 (REST v1 retired 2026-11-15; fleet-chezmoi#2085). On v2 an endpoint carries its own
+# image, env, disk and registry: a v2 template is applied once at create and keeps no link, so this
+# script makes no template and updates the endpoint itself. Paths and fields are from RunPod's v2
+# OpenAPI (https://api.runpod.io/v2/openapi.json). RUNPOD_API_BASE is for this script's own tests.
+API="${RUNPOD_API_BASE:-https://api.runpod.io/v2}"
 
 # ---- 0. load and check deploy.env -------------------------------------------
 [ -f deploy.env ] || die "deploy.env not found. Run: cp deploy.env.example deploy.env  (then edit it)."
@@ -32,7 +36,7 @@ need() { local v; eval "v=\${$1:-}"; [ -n "$v" ] || die "deploy.env: $1 is requi
 need RUNPOD_API_KEY "your RunPod API key (runpod.io -> Settings -> API Keys)"
 need IMAGE          "the image ref to build and run, e.g. ghcr.io/<you>/<repo>:latest"
 need ENDPOINT_NAME  "a name for the RunPod endpoint"
-need GPU_TYPE_IDS   "which GPU(s) to pin the endpoint to (see deploy.env.example)"
+[ -n "${GPU_TYPE_IDS:-}${GPU_POOLS:-}" ] || die "deploy.env: set GPU_TYPE_IDS (which GPU card(s) to pin the endpoint to) or GPU_POOLS (RunPod v2 pools) -- see deploy.env.example"
 
 # sensible defaults for the optional knobs
 CONTAINER_DISK_GB="${CONTAINER_DISK_GB:-20}"
@@ -103,24 +107,10 @@ api() {  # method path [body]
   fi
 }
 
-# 3a. template: reuse one with this name if it exists, else create it.
-say "Step 3/4: RunPod template + endpoint"
-TPL_NAME="${ENDPOINT_NAME}-template"
-info "looking for an existing template named $TPL_NAME"
-TPL_ID="$(api GET /templates | python3 -c '
-import sys,json
-name=sys.argv[1]
-try: data=json.load(sys.stdin)
-except Exception: data=[]
-items=data.get("templates",data) if isinstance(data,dict) else data
-for t in (items or []):
-    if isinstance(t,dict) and t.get("name")==name:
-        print(t.get("id","")); break
-' "$TPL_NAME" 2>/dev/null || true)"
-
-# build the template body (env carries R2 creds for the finish-chain R2 mode, if you set them)
-TPL_BODY="$(python3 -c '
-import json,os
+# 3. endpoint: one v2 endpoint named $ENDPOINT_NAME, created or updated in place with everything on it.
+say "Step 3/4: RunPod endpoint"
+EP_BODY="$(python3 -c '
+import json,os,sys
 # endpoint env: R2 finish-chain creds plus any handler tuning knobs you set in deploy.env.
 env={}
 for k in ("R2_ENDPOINT_URL","R2_BUCKET","R2_ACCESS_KEY_ID","R2_SECRET_ACCESS_KEY",
@@ -131,53 +121,70 @@ for k in ("R2_ENDPOINT_URL","R2_BUCKET","R2_ACCESS_KEY_ID","R2_SECRET_ACCESS_KEY
 # The container has to KNOW the platform ceiling to size its own wall-clock guard under it (#105), and
 # the only way that number cannot drift is to derive it from the same value we set on the endpoint.
 env["UPSCALE_PLATFORM_TIMEOUT"]=str(int(os.environ["EXECUTION_TIMEOUT_MS"])//1000)
-b={"name":os.environ["TPL_NAME"],"imageName":os.environ["IMAGE"],"isServerless":True,
-   "containerDiskInGb":int(os.environ["CONTAINER_DISK_GB"]),"category":"NVIDIA","env":env}
+# GPU type -> v2 pool, from the RunPod GPU catalog (list-gpu-types, read 2026-11-11). A pool holds
+# several cards of one class. GPU_POOLS names pools directly and wins when set.
+POOL={"NVIDIA H200":"HOPPER_141","NVIDIA B200":"BLACKWELL_180","NVIDIA B300 SXM6 AC":"BLACKWELL_288",
+      "NVIDIA H100 80GB HBM3":"ADA_80_PRO","NVIDIA H100 NVL":"ADA_80_PRO","NVIDIA H100 PCIe":"ADA_80_PRO",
+      "NVIDIA A100 80GB PCIe":"AMPERE_80","NVIDIA A100-SXM4-80GB":"AMPERE_80",
+      "NVIDIA RTX PRO 6000 Blackwell Server Edition":"BLACKWELL_96",
+      "NVIDIA RTX PRO 6000 Blackwell Workstation Edition":"BLACKWELL_96",
+      "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition":"BLACKWELL_96",
+      "NVIDIA L40":"ADA_48_PRO","NVIDIA L40S":"ADA_48_PRO","NVIDIA RTX 6000 Ada Generation":"ADA_48_PRO",
+      "NVIDIA A40":"AMPERE_48","NVIDIA RTX A6000":"AMPERE_48",
+      "NVIDIA GeForce RTX 5090":"ADA_32_PRO","NVIDIA GeForce RTX 4090":"ADA_24",
+      "NVIDIA GeForce RTX 3090":"AMPERE_24","NVIDIA RTX A5000":"AMPERE_24","NVIDIA L4":"AMPERE_24"}
+pools=[x.strip() for x in os.environ.get("GPU_POOLS","").split(",") if x.strip()]
+if not pools:
+    for g in [x.strip() for x in os.environ.get("GPU_TYPE_IDS","").split(",") if x.strip()]:
+        if g not in POOL:
+            sys.exit("no RunPod v2 pool is known for GPU type %r; set GPU_POOLS (e.g. BLACKWELL_96) in deploy.env" % g)
+        if POOL[g] not in pools: pools.append(POOL[g])
+b={"name":os.environ["ENDPOINT_NAME"],"image":os.environ["IMAGE"],"env":env,
+   "disk":int(os.environ["CONTAINER_DISK_GB"]),"gpu":{"pools":pools,"count":1},
+   "workers":{"min":int(os.environ["WORKERS_MIN"]),"max":int(os.environ["WORKERS_MAX"]),
+              "idleTimeout":int(os.environ["IDLE_TIMEOUT"])},
+   "scaling":{"type":"QUEUE_DELAY","queueDelay":4},
+   "timeout":int(os.environ["EXECUTION_TIMEOUT_MS"])}
 auth=os.environ.get("CONTAINER_REGISTRY_AUTH_ID","")
-if auth: b["containerRegistryAuthId"]=auth
+if auth: b["registry"]=auth
 print(json.dumps(b))
-' )"
-export TPL_NAME
+' )" || die "could not build the endpoint settings (see the message above)"
 
-if [ -n "$TPL_ID" ]; then
-  info "updating existing template $TPL_ID"
-  api PATCH "/templates/$TPL_ID" "$TPL_BODY" >/dev/null || die "template update failed"
-else
-  info "creating template $TPL_NAME"
-  TPL_ID="$(api POST /templates "$TPL_BODY" | pyget id)"
-  [ -n "$TPL_ID" ] || die "could not read the new template id"
-  info "created template $TPL_ID"
-fi
-
-# 3b. endpoint: reuse one with this name if it exists, else create it.
+# Find the endpoint by name across every v2 page. "More pages but no cursor" stops the run: guessing
+# "not found" would create a duplicate endpoint.
 info "looking for an existing endpoint named $ENDPOINT_NAME"
-EP_ID="$(api GET /endpoints | python3 -c '
+EP_ID=""; CURSOR=""; PAGES=0
+while : ; do
+  PAGE="$(api GET "/serverless?limit=1000${CURSOR:+&cursor=$CURSOR}")" || die "could not list RunPod endpoints"
+  LINE="$(printf '%s' "$PAGE" | python3 -c '
 import sys,json
 name=sys.argv[1]
-try: data=json.load(sys.stdin)
-except Exception: data=[]
-items=data.get("endpoints",data) if isinstance(data,dict) else data
-for e in (items or []):
+try: d=json.load(sys.stdin)
+except Exception: d={}
+items=d if isinstance(d,list) else (d.get("endpoints") or d.get("items") or d.get("data") or [])
+hit=""
+for e in items:
     if isinstance(e,dict) and e.get("name")==name:
-        print(e.get("id","")); break
-' "$ENDPOINT_NAME" 2>/dev/null || true)"
+        hit=e.get("id",""); break
+pg=d.get("pagination") if isinstance(d,dict) else None
+more="yes" if isinstance(pg,dict) and pg.get("hasNextPage") is True else "no"
+nxt=(pg.get("nextCursor") or "") if isinstance(pg,dict) else ""
+print(hit+"\t"+nxt+"\t"+more)
+' "$ENDPOINT_NAME")"
+  EP_ID="$(printf '%s' "$LINE" | cut -f1)"
+  [ -n "$EP_ID" ] && break
+  [ "$(printf '%s' "$LINE" | cut -f3)" = "yes" ] || break
+  CURSOR="$(printf '%s' "$LINE" | cut -f2)"
+  [ -n "$CURSOR" ] || die "RunPod's endpoint list said there were more pages but gave no cursor; not guessing"
+  PAGES=$((PAGES + 1)); [ "$PAGES" -lt 1000 ] || die "RunPod's endpoint list did not end; not guessing"
+done
 
 if [ -n "$EP_ID" ]; then
-  info "endpoint $ENDPOINT_NAME already exists ($EP_ID) -- leaving its GPU/scaling as set"
-  info "(RunPod does not let the API change an endpoint's GPU list after creation; use the console to re-pin)"
+  info "updating endpoint $ENDPOINT_NAME ($EP_ID): image, env, GPU pools, workers and timeout"
+  api PATCH "/serverless/$EP_ID" "$EP_BODY" >/dev/null || die "endpoint update failed"
 else
-  # gpuTypeIds is a comma-separated list in deploy.env; turn it into a JSON array.
-  EP_BODY="$(GPU_TYPE_IDS="$GPU_TYPE_IDS" TPL_ID="$TPL_ID" python3 -c '
-import json,os
-gpus=[g.strip() for g in os.environ["GPU_TYPE_IDS"].split(",") if g.strip()]
-b={"name":os.environ["ENDPOINT_NAME"],"templateId":os.environ["TPL_ID"],"computeType":"GPU",
-   "gpuTypeIds":gpus,"workersMin":int(os.environ["WORKERS_MIN"]),
-   "workersMax":int(os.environ["WORKERS_MAX"]),"idleTimeout":int(os.environ["IDLE_TIMEOUT"]),
-   "executionTimeoutMs":int(os.environ["EXECUTION_TIMEOUT_MS"]),"scalerType":"QUEUE_DELAY","scalerValue":4}
-print(json.dumps(b))
-' )"
   info "creating endpoint $ENDPOINT_NAME"
-  EP_ID="$(api POST /endpoints "$EP_BODY" | pyget id)"
+  EP_ID="$(api POST /serverless "$EP_BODY" | pyget id)"
   [ -n "$EP_ID" ] || die "could not read the new endpoint id"
   info "created endpoint $EP_ID"
 fi
