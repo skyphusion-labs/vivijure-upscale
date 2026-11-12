@@ -228,3 +228,11 @@ PR, then an org admin tags its merge commit `vMAJOR.MINOR.PATCH` (CI publishes t
 To release, merge a release PR; then an org admin tags that PR's merge commit
 (`sha="$(gh pr view <release-pr> --json mergeCommit -q .mergeCommit.oid)"; git tag -a vX.Y.Z -m "..." "$sha" && git push origin vX.Y.Z`).
 Deploy workflows assert the tag commit is an ancestor of `origin/main`.
+
+## Release convention (bump-at-release)
+
+One convention for every skyphusion-labs repo (Conrad, ruled 2026-11-10, fleet-chezmoi#1766). A version moves ONLY in a release PR: bump the version, then assemble the changelog. Feature and fix PRs do not bump. Releases go through a PR (fleet-chezmoi#1622) and the tag goes on that PR's merge commit.
+
+- Version of record here: no manifest version: the git tag is the version of record.
+- Tag shape: `v*`.
+- Check before a release PR: does a tag already exist for the version currently in the manifest? Yes means the cycle is closed, so the release PR bumps. No means a bump already landed outside a release PR; stop and read why before bumping again.
