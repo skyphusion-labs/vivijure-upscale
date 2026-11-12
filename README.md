@@ -28,20 +28,18 @@ flowchart TD
 
     subgraph modules[Modules: one job each, opt-in]
         cloudmods[Cloud video modules<br/>Seedance, Kling, Veo, Wan, ...]
-        finishmods[Finish modules<br/>upscale, smooth, lip-sync, titles]
+        finishmods[Finish modules<br/>upscale, smooth, titles]
         audiomods[Audio modules<br/>music, narration]
     end
 
     subgraph gpu[The GPU render engines]
-        backend[vivijure-backend<br/>RunPod cloud GPU:<br/>keyframes, image-to-video, LoRA training]
+        backend[vivijure-backend<br/>RunPod cloud GPU:<br/>SDXL keyframes]
         local12[vivijure-local-12gb<br/>your own 12GB card LTX]
         local16[vivijure-local-16gb<br/>your own 16GB card CogVideoX]
     end
 
     subgraph finish[Finish helper engines]
-        musetalk[vivijure-musetalk<br/>lip-sync]
         upscale[vivijure-upscale<br/>video upscale]
-        audioup[vivijure-audio-upscale<br/>audio cleanup]
     end
 
     discord --> slate
@@ -50,10 +48,7 @@ flowchart TD
     studio --> cloudmods
     studio --> finishmods
     studio --> audiomods
-    cloudmods --> backend
-    finishmods --> musetalk
     finishmods --> upscale
-    audiomods --> audioup
     studio --> backend
     studio --> local12
     studio --> local16
@@ -62,8 +57,7 @@ flowchart TD
 The full map, with a plain-English walk-through, is in [docs/constellation.md](docs/constellation.md).
 
 This engine runs late in the finish chain, raising a shot (or the assembled film) back to delivery
-resolution. It pairs with the [lip-sync engine](https://github.com/skyphusion-labs/vivijure-musetalk),
-which works a small face region and leans on this one to return to full size.
+resolution.
 
 ## Deploy this finish engine
 
@@ -182,7 +176,7 @@ their own GitHub identity.
 
 Vivijure operators wiring **video upscale finish** on RunPod GPU (Real-ESRGAN super-resolution for final delivery).
 
-**Vivijure Studio:** https://vivijure.dev · **Live demo:** https://demo.vivijure.com · **Skyphusion Labs:** https://skyphusion.org
+**Vivijure Studio:** https://vivijure.dev · **Skyphusion Labs:** https://skyphusion.org
 
 ## Support
 
